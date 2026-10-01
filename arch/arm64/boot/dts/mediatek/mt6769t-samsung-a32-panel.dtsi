@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Samsung Galaxy A32 (SM-A325F) S6E3FC3 panel wiring fragment.
+ *
+ * MERGE INSTRUCTION FOR THE ORCHESTRATOR (board DTS is NOT edited here):
+ *   1. In kernel/mainline/arch/arm64/boot/dts/mediatek/mt6769t-samsung-a32.dts,
+ *      DELETE the a32_panel_stub node (compatible "samsung,a32-panel-stub",
+ *      status "disabled", TODO-PANEL) under &dsi0.
+ *   2. Either #include this file from the board DTS (same directory) or paste
+ *      the &dsi0 block below in place of the stub, and paste the / { ... }
+ *      regulator nodes at the board root level.
+ *   3. Flip &dsi0 status to "okay" (kept "disabled" here so this fragment is
+ *      inert on its own -- the board DTS owns the enable decision).
+ *   4. Keep &dsi_out remote-endpoint as-is (already points at the panel port).
+ *
+ * Evidence (display_lcd_a32_common.dtsi, downstream, read-only):
+ *   LCD_RST   = pio45  (:27)  -> reset-gpios
+ *   LCD_1P8_EN= pio25  (:34)  -> lcd_1p8 fixed regulator -> vddio-supply
+ *   LCD_3P0_EN= pio153 (:41)  -> lcd_3p0 fixed regulator -> vci-supply
+ *   Power: 1p8 -> 2ms -> 3p0 -> 2ms (:56-62); reset 1/1/1/11ms (:71-80).
+ *   CON_DET pio92 / ESD_DET pio179 / PCD_DET pio54 / ERR_FG pio28 (:48-51)
+ *   have no mainline consumer and are deliberately NOT wired here.
+ *   Backlight needs no DT node: the panel driver registers its own
+ *   backlight device (0..486, HBM above 255).
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	lcd_1p8: regulator-lcd-1p8 {
+		compatible = "regulator-fixed";
+		regulator-name = "lcd_1p8_en";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		gpio = <&pio 25 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	lcd_3p0: regulator-lcd-3p0 {
+		compatible = "regulator-fixed";
+		regulator-name = "lcd_3p0_en";
+		regulator-min-microvolt = <3000000>;
+		regulator-max-microvolt = <3000000>;
+		gpio = <&pio 153 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&dsi0 {
+	/* Orchestrator flips this to "okay" when merging (see header). */
+	status = "disabled";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	panel@0 {
+		compatible = "samsung,s6e3fc3-a32";
+		reg = <0>;
+		reset-gpios = <&pio 45 GPIO_ACTIVE_HIGH>;
+		vddio-supply = <&lcd_1p8>;
+		vci-supply = <&lcd_3p0>;
+
+		port {
+			a32_panel_in: endpoint {
+				remote-endpoint = <&dsi_out>;
+			};
+		};
+	};
+};

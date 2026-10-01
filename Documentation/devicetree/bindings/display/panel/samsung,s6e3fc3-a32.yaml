@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/panel/samsung,s6e3fc3-a32.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung S6E3FC3 (Galaxy A32) AMOLED DSI command-mode panel
+
+description: The S6E3FC3 (AMS638YQ01) is a 1080x2400 AMOLED command-mode
+  DSI panel from Samsung Mobile Displays, as fitted to the Samsung Galaxy
+  A32 (SM-A325F). Panel timings, rails and reset sequencing are taken from
+  the downstream display_lcd_a32_common.dtsi (see the driver for line refs).
+  HARDWARE-UNPROVEN: no mainline-probed unit has validated this binding yet.
+
+maintainers:
+  - A32 Mainline Bringup
+
+allOf:
+  - $ref: panel-common.yaml#
+
+properties:
+  compatible:
+    const: samsung,s6e3fc3-a32
+
+  reg:
+    maxItems: 1
+
+  reset-gpios:
+    description: LCD_RST (A32 pio45)
+    maxItems: 1
+
+  port: true
+
+  vddio-supply:
+    description: 1.8V LCD rail (LCD_1P8_EN, A32 pio25)
+
+  vci-supply:
+    description: 3.0V LCD rail (LCD_3P0_EN, A32 pio153)
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - vddio-supply
+  - vci-supply
+  - port
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    / {
+        lcd_1p8: regulator-lcd-1p8 {
+            compatible = "regulator-fixed";
+            regulator-name = "lcd_1p8_en";
+            regulator-min-microvolt = <1800000>;
+            regulator-max-microvolt = <1800000>;
+            gpio = <&pio 25 GPIO_ACTIVE_HIGH>;
+            enable-active-high;
+        };
+
+        lcd_3p0: regulator-lcd-3p0 {
+            compatible = "regulator-fixed";
+            regulator-name = "lcd_3p0_en";
+            regulator-min-microvolt = <3000000>;
+            regulator-max-microvolt = <3000000>;
+            gpio = <&pio 153 GPIO_ACTIVE_HIGH>;
+            enable-active-high;
+        };
+    };
+
+    dsi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel@0 {
+            compatible = "samsung,s6e3fc3-a32";
+            reg = <0>;
+            reset-gpios = <&pio 45 GPIO_ACTIVE_HIGH>;
+            vddio-supply = <&lcd_1p8>;
+            vci-supply = <&lcd_3p0>;
+
+            port {
+                panel_in: endpoint {
+                    remote-endpoint = <&dsi_out>;
+                };
+            };
+        };
+    };
+
+...
