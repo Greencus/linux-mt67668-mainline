@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * MT6768 MUSB/UDC A32 evidence fragment (Track C).
+ *
+ * Include from the A32 board DTS once wired:
+ *   #include "mt6769t-samsung-a32-usb.dtsi"
+ * (Wiring the #include into mt6769t-samsung-a32.dts is out of scope for
+ * this change; the fragment is standalone and validated via a /tmp
+ * wrapper + dtc, never by editing the board file here.)
+ *
+ * Evidence anchored per property (trailing tags):
+ *   SoC-common     = already in mt6768.dtsi, repeated here as override
+ *   board-specific = A32 policy (measured/inferred, never Redmi-copied)
+ *   measured       = live/DT-observed on this program's references
+ *   inferred       = reasoned default, marked as such
+ *
+ * Deliberate OMISSIONS (do NOT "complete" without A32 evidence):
+ * - No TCPC / typec connector node: Redmi willsemi,wusb3801 path is
+ *   explicitly excluded; A32 TCPC is unknown (TODO-USB-ROLE stays open).
+ * - No vbus-supply / VBUS GPIO / regulator: none evidenced for A32; the
+ *   glue intentionally provides no set_vbus override (see mt6768.c).
+ * - No dr_mode hard-coding to host/peripheral: measured policy is OTG
+ *   with configfs gadget (sys.usb.controller=musb-hdrc); role defaults
+ *   to software control.
+ * - No HS tuning / tune@ tables: downstream phy_tuning values are NOT
+ *   copied; generic-tphy-v1 owns the PHY.
+ * - No pericfg/reset DT property: the musb binding forbids extra props;
+ *   the glue resolves "mediatek,mt6768-pericfg" via syscon at runtime.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/phy/phy.h>
+
+/* Controller: downstream usb0@11200000 (mediatek,mt6768-usb20,
+ * 0x11200000/0x10000 + 0x11CC0000/0x10000, GIC_SPI 97 LEVEL_LOW,
+ * mode=2 multipoint=1 num_eps=16, infracfg_ao CLK_IFR_ICUSB +
+ * USB_TOP_SEL + UNIVPLL3_D4). Mainline decodes the first 0x1000 as the
+ * musb window; the PHY window lives in &usb2phy below. */
+&usb2 {
+	compatible = "mediatek,mt6768-musb", "mediatek,mtk-musb"; /* SoC-common */
+	reg = <0 0x11200000 0 0x1000>; /* SoC-common: musb-decoded window (downstream maps 0x10000) */
+	interrupts = <GIC_SPI 97 IRQ_TYPE_LEVEL_LOW>; /* measured */
+	interrupt-names = "mc"; /* SoC-common */
+	clocks = <&infracfg_ao CLK_INFRA_ICUSB>, /* measured */
+		 <&topckgen CLK_TOP_USB_TOP_SEL>, /* measured */
+		 <&topckgen CLK_TOP_UNIVPLL3_D4>; /* measured */
+	clock-names = "main", "mcu", "univpll"; /* SoC-common */
+	phys = <&usb2port0 PHY_TYPE_USB2>; /* SoC-common */
+	dr_mode = "otg"; /* measured: configfs gadget + musb-hdrc UDC policy */
+	usb-role-switch; /* board-specific: software role until TCPC known */
+	status = "okay"; /* measured */
+
+	ports {
+		#address-cells = <1>; /* SoC-common */
+		#size-cells = <0>; /* SoC-common */
+
+		port@0 {
+			usb2phy_port: endpoint {
+				/* remote-endpoint: typec connector, TODO-USB-ROLE */ /* board-specific */
+			};
+		};
+		port@1 {
+			usb_phy_ep: endpoint {
+				remote-endpoint = <&phy_sw_ep>; /* SoC-common */
+			};
+		};
+	};
+};
+
+/* PHY: t-phy@11cc0000, mediatek,mt6768-tphy + generic-tphy-v1 (V1 pdata).
+ * Covers the downstream 0x11CC0000 window. No tuning values here. */
+&usb2phy {
+	status = "okay"; /* measured: tphy present */
+};
+
+/* Software role-switch (no TCPC copied). */
+&usb2port0 {
+	mediatek,software-role-switch; /* inferred: role-switch until TCPC known */
+
+	port {
+		phy_sw_ep: endpoint {
+			remote-endpoint = <&usb_phy_ep>; /* SoC-common */
+		};
+	};
+};
