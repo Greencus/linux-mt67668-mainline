@@ -13,8 +13,12 @@
 /dts-v1/;
 
 #include <dt-bindings/gpio/gpio.h>
-#include "mt6769t.dtsi" /* pulls mt6768.dtsi + 1.8GHz cluster0 OPP */ /* SoC-common */
+#include "mt6768.dtsi" /* pulls mt6768.dtsi + 1.8GHz cluster0 OPP */ /* SoC-common */
 #include "mt6358.dtsi" /* MT6358 companion PMIC, measured on this unit */ /* measured */
+#include "mt6769t-samsung-a32-ccci.dtsi" /* Track A: modem-ccci DISABLED until TODO-CCCI-PROBE */ /* board-specific */
+#include "mt6769t-samsung-a32-bt.dtsi" /* Track B: bluetooth-a32 DISABLED until BTIF gates close */ /* board-specific */
+#include "mt6769t-samsung-a32-usb.dtsi" /* Track C: mt6768-musb glue override, usb2 ENABLED (otg) */ /* board-specific */
+#include "mt6769t-samsung-a32-panel.dtsi" /* Track D: s6e3fc3 panel wiring, dsi0 ENABLED (see below) */ /* board-specific */
 
 &{/} {
 	model = "Samsung Galaxy A32"; /* board-specific */
@@ -190,33 +194,17 @@
 	domain-supply = <&mt6358_vgpu_reg>; /* inferred: family pattern */
 };
 
-/* DSI + panel: downstream proves Samsung s6e3fc3, DSI CMD 4-lane, 1080x2400
- * (display_lcd_a32_common.dtsi). panel-simple timings + init-seq UNKNOWN, so
- * the panel below is a FAIL-SAFE STUB: non-matching compatible (never binds),
- * status disabled, NO invented timings. TODO-PANEL to enable. */
+/* DSI + panel (Track D merge): the FAIL-SAFE STUB
+ * (compatible "samsung,a32-panel-stub") is DELETED here and replaced by the
+ * real entry from mt6769t-samsung-a32-panel.dtsi (included above), per that
+ * fragment's MERGE INSTRUCTION: stub node removed, #address-cells/#size-cells
+ * and panel@0 (compatible "samsung,s6e3fc3-a32", LCD_RST=pio45,
+ * LCD_1P8_EN=pio25, LCD_3P0_EN=pio153) come from the fragment, and &dsi0 is
+ * flipped to "okay" below. Panel itself stays HARDWARE-UNPROVEN (TODO-PANEL).
+ * Integration states: dsi0/panel ENABLED (unproven); modem-ccci DISABLED;
+ * bluetooth-a32 DISABLED; usb2 musb ENABLED. */
 &dsi0 {
-	status = "disabled"; /* board-specific: stays off until TODO-PANEL closes */
-	#address-cells = <1>; /* SoC-common */
-	#size-cells = <0>; /* SoC-common */
-
-	a32_panel_stub: panel@0 {
-		/* STUB: compatible matches NO driver (intentional). Real entry lands
-		 * here once init-seq + timings are captured. TODO-PANEL. */
-		compatible = "samsung,a32-panel-stub"; /* board-specific */
-		reg = <0>; /* SoC-common */
-		/* Vendor-derived LCD GPIOs (downstream display_lcd_a32_common.dtsi),
-		 * recorded here, wired when the real entry lands:
-		 * LCD_RST=pio45, LCD_1P8_EN=pio25, LCD_3P0_EN=pio153,
-		 * CON_DET=pio92, ESD_DET=pio179, PCD_DET=pio54, ERR_FG=pio28. */
-		reset-gpios = <&pio 45 GPIO_ACTIVE_HIGH>; /* vendor-derived */
-		status = "disabled"; /* board-specific: FAIL SAFE */
-
-		port {
-			a32_panel_in: endpoint {
-				remote-endpoint = <&dsi_out>; /* SoC-common */
-			};
-		};
-	};
+	status = "okay"; /* board-specific: enabled per Track D merge instruction */
 };
 
 &dsi_out {
