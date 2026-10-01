@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MTK_CCCI
+	tristate "MediaTek MT6768 CCCI modem transport"
+	depends on OF && NET && TTY
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Clean-room mainline port of the MT6768 (MD_SYS1) CCCI modem
+	  transport: CLDMA data path, ccmni RAW-IP netdevs, ttyC*
+	  devices, ccci_node class + /sys/kernel/ccci/boot.
+
+	  Values are transcribed from the downstream reference tree
+	  (read-only); the live modem transport is HARDWARE-UNPROVEN
+	  (no firmware in this tree, modem held pre-HS1).
+
+	  To compile as a module, choose M here: the module is mtk-ccci.

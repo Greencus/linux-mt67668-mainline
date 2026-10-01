@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * mt6769t-samsung-a32-ccci.dtsi -- A32 CCCI modem transport (Track A) fragment.
+ *
+ * Wiring (gated): add one line to mt6769t-samsung-a32.dts once the
+ * hardware gates close (TODO-CCCI-PROBE):
+ *
+ *     #include "mt6769t-samsung-a32-ccci.dtsi"
+ *
+ * The board .dts is intentionally NOT modified by this change; this
+ * fragment is inert until included.
+ *
+ * Value provenance (all transcribed from the downstream reference tree,
+ * read-only -- no A32-specific modem values are invented):
+ * - regs / interrupts / clocks / md_id / cldma_capability: downstream
+ *   arch/arm64/boot/dts/mediatek/mt6768.dts mdcldma@10014000 node
+ *   ("mediatek,mdcldma"). Reg order is CLDMA_AO, CLDMA_PDN, AP_CCIF,
+ *   MD_CCIF; IRQ order is CLDMA, CCIF0, CCIF1, WDT.
+ * - clock-names strings: downstream md_sys1_platform.c clk_table[]
+ *   ("infra-cldma-bclk", "infra-ccif-ap/md", "infra-ccif1-ap/md",
+ *   "infra-ccif2-ap/md"). The clocks phandles use the MAINLINE binding
+ *   (dt-bindings/clock/mediatek,mt6768-clk.h CLK_INFRA_*), already
+ *   included via mt6768.dtsi.
+ * - IRQ request mode IRQF_TRIGGER_NONE: downstream md_sys1_platform.c
+ *   ("Device tree using none flag ... sensitivity has set at
+ *   irq_of_parse_and_map"); the DT keeps the downstream trigger types.
+ * - compatible: deliberately NOT "mediatek,mdcldma" (no mainline binding
+ *   exists for it); "mediatek,mt6768-ccci" matches the clean-room
+ *   platform driver in drivers/misc/mtk-ccci/.
+ *
+ * Gating:
+ * - status = "disabled": live modem transport is HARDWARE-UNPROVEN (no
+ *   firmware in this tree; the driver holds the modem pre-HS1). Flip to
+ *   "okay" only when modem boot + HS1/HS2 handshake are proven on A32
+ *   silicon. TODO-CCCI-PROBE.
+ * - scp-sys-md1-main clock OMITTED: downstream lists it first in clocks,
+ *   but the mainline scpsys node is a power-controller with no clock
+ *   output. TODO-SCP: re-add once a mainline scp clock provider exists.
+ * - modem firmware/shm carveouts OMITTED: reserved-memory in mt6768.dtsi
+ *   is empty and no LK/EMI modem-region evidence is in the tree.
+ *   TODO-MDMRSV: add only from LK/EMI evidence (never invent addresses).
+ * - MD boot-vector / boot-stats registers (downstream modem_reg_base.h
+ *   MD_BOOT_VECTOR_EN 0x20000024, MD1_CFG 0x1020E300) are NOT described
+ *   here: downstream hard-codes them, mainline must DT-provide them.
+ *   TODO-BOOTVEC: extend the binding (or a syscon) when the probe
+ *   sequence needs them.
+ */
+
+&{/} {
+	ccci_md1: modem-ccci@10014000 {
+		compatible = "mediatek,mt6768-ccci"; /* mainline-specific */
+		reg = <0 0x10014000 0 0x1000>, /* downstream mdcldma: CLDMA_AO */
+		      <0 0x1021b000 0 0x1000>, /* downstream mdcldma: CLDMA_PDN */
+		      <0 0x10209000 0 0x1000>, /* downstream mdcldma: AP_CCIF */
+		      <0 0x1020a000 0 0x1000>; /* downstream mdcldma: MD_CCIF */
+		interrupts = <GIC_SPI 180 IRQ_TYPE_LEVEL_HIGH>, /* CLDMA */
+			     <GIC_SPI 164 IRQ_TYPE_LEVEL_LOW>, /* CCIF0 */
+			     <GIC_SPI 165 IRQ_TYPE_LEVEL_LOW>, /* CCIF1 */
+			     <GIC_SPI 75 IRQ_TYPE_EDGE_FALLING>; /* MD WDT */
+		mediatek,md_id = <0>; /* downstream mdcldma: MD_SYS1 */
+		mediatek,cldma_capability = <6>; /* downstream mdcldma */
+		clocks = <&infracfg_ao CLK_INFRA_CLDMA_BCLK>,
+			 <&infracfg_ao CLK_INFRA_CCIF_AP>,
+			 <&infracfg_ao CLK_INFRA_CCIF_MD>,
+			 <&infracfg_ao CLK_INFRA_CCIF1_AP>,
+			 <&infracfg_ao CLK_INFRA_CCIF1_MD>,
+			 <&infracfg_ao CLK_INFRA_CCIF2_AP>,
+			 <&infracfg_ao CLK_INFRA_CCIF2_MD>;
+		clock-names = "infra-cldma-bclk",
+			      "infra-ccif-ap",
+			      "infra-ccif-md",
+			      "infra-ccif1-ap",
+			      "infra-ccif1-md",
+			      "infra-ccif2-ap",
+			      "infra-ccif2-md";
+		/* CLDMA/CCIF reset runs through the infracfg AO domain
+		 * (downstream md_cldma_hw_reset). Acquired by the driver,
+		 * never written until TODO-CCIF-RESET closes.
+		 */
+		mediatek,infracfg_ao = <&infracfg_ao>;
+		/* HARDWARE-UNPROVEN gate: see header. TODO-CCCI-PROBE. */
+		status = "disabled";
+	};
+};
