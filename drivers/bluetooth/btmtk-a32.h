@@ -30,6 +30,27 @@
  * - BTIF is the COMPILE-TIME default transport:
  *     connac2/Makefile:28 (-DCHIP_IF_BTIF),
  *     connac2/Makefile.ce:23, selector connac2/btmtk_chip_if.h:25.
+ * - Wakeup-IRQ shape (§3):
+ *     connac2/btmtk_irq.c:39-40 (bt_irq_ctrl table: "BTIF_WAKEUP_IRQ" /
+ *     "BGF_SW_IRQ"), :198-199 (wakeup = FW-has-data, SW = fw assert/log),
+ *     :211-226 (handler: match irq_num, disable_irq, set rx_ind /
+ *     bgf2ap_ind + clear sleep_flag, wake_up tx_waitq, else IRQ_NONE),
+ *     :239-290 (bt_request_irq: DTS-resolved via irq_of_parse_and_map on
+ *     compatible "mediatek,bt", index 0 = wakeup / 1 = SW,
+ *     IRQF_TRIGGER_HIGH|IRQF_SHARED), :303-352 (enable/disable with
+ *     spinlock + active flag, disable_irq_nosync on the disable leg);
+ *     request-then-mask at connac2/btmtk_mt66xx.c:1139-1149 (both IRQs
+ *     requested, both disabled immediately), freed at :1161-1164/:1190;
+ *     numeric IDs MT_BGF2AP_BTIF_WAKEUP_IRQ_ID 312 / MT_BGF2AP_SW_IRQ_ID
+ *     271 are marked temp-only (connac2/btmtk_btif.h:61-62) and are
+ *     NOT authoritative; PSM sleep/wake at connac2/btmtk_btif_main.c:
+ *     :1306-1347 (SLEEP wakeup: disable IRQ, FW-own clear, -> NORMAL_TR),
+ *     :1356-1360 (rx_ind consumed, "wakeup by BTIF_WAKEUP_IRQ"),
+ *     :1420-1438 (NORMAL sleep entry: FW-own set, enable IRQ, -> SLEEP);
+ *     wakeup_source "bt_psm" lock at connac2/btmtk_btif.h:456-467;
+ *     BTIF owner "CONSYS_BT" (connac2/btmtk_btif_main.c:46); sibling
+ *     DTS-resolved request_irq + enable_irq_wake precedent at
+ *     wmt_drv/common_main/platform/wmt_plat_alps.c:619-637.
  */
 
 #ifndef __BTMTK_A32_H
@@ -101,6 +122,94 @@ typedef uint32_t u32;
 #define BTMTK_A32_FW_CFG	"BT_FW.cfg"
 #define BTMTK_A32_FW_COUNT	3	/* request_firmware() set */
 #define BTMTK_A32_FW_RETRY	10	/* mirror downstream retry budget */
+
+/* ------------------------------------------------------------------
+ * §3 wakeup-IRQ contract (pure part: indices, DT names, PSM states).
+ *
+ * Downstream resolves both IRQs from DT, never from drum-tight
+ * constants: bt_request_irq() maps index 0 (wakeup) / 1 (SW) of the
+ * compatible "mediatek,bt" node (btmtk_irq.c:249-269). This driver
+ * keeps that contract via platform_get_irq_byname() on the
+ * interrupt-names below; the DT fragment carries the names (+
+ * wakeup-source) while the numeric line stays TODO-HWIRQ until the
+ * actual A32 CONNSYS->GIC/sysirq routing is confirmed on hardware
+ * (the 312/271 IDs are downstream-marked "temp" and MUST NOT be used).
+ * ------------------------------------------------------------------
+ */
+
+/* Downstream DTS indices (btmtk_irq.c:249-269: index 0 = BTIF_WAKEUP,
+ * index 1 = SW). Order only; no GIC numbers are implied.
+ */
+#define BTMTK_A32_IRQ_WAKEUP	0
+#define BTMTK_A32_IRQ_SW	1
+#define BTMTK_A32_IRQ_COUNT	2
+
+/* DT interrupt-names for this driver's binding. The request_irq() devname
+ * args keep the downstream .name strings (btmtk_irq.c:39-40) so traces
+ * match: "BTIF_WAKEUP_IRQ" / "BGF_SW_IRQ".
+ */
+#define BTMTK_A32_IRQ_NAME_WAKEUP	"wakeup"
+#define BTMTK_A32_IRQ_NAME_SW		"sw"
+#define BTMTK_A32_IRQ_DEVNAME_WAKEUP	"BTIF_WAKEUP_IRQ"
+#define BTMTK_A32_IRQ_DEVNAME_SW	"BGF_SW_IRQ"
+
+/* Wakeup-source hold (ms) per FW-wakeup event. Downstream holds the
+ * "bt_psm" wake lock across the whole TX/wakeup window (__pm_stay_awake
+ * + qos, btmtk_btif.h:426-454); the mainline equivalent here is a bounded
+ * __pm_wakeup_event() per IRQ-thread drain.
+ */
+#define BTMTK_A32_WAKE_HOLD_MS	100
+
+/* Power-save states mirroring the downstream PSM (btmtk_btif_main.c
+ * PSM_ST_SLEEP / PSM_ST_NORMAL_TR).
+ */
+enum btmtk_a32_psm {
+	BTMTK_A32_PSM_SLEEP = 0,
+	BTMTK_A32_PSM_NORMAL = 1,
+};
+
+/* PSM input events. */
+enum btmtk_a32_psm_ev {
+	BTMTK_A32_EV_WAKE_IRQ = 0,	/* FW wakeup IRQ (has data) */
+	BTMTK_A32_EV_SLEEP_REQ,		/* host asks to enter sleep */
+	BTMTK_A32_EV_WAKE_REQ,		/* host forces awake */
+	BTMTK_A32_EV_FW_OWN_FAIL,	/* FW-own clear failed mid-wakeup */
+};
+
+/**
+ * btmtk_a32_psm_next - PSM transition, mirroring downstream semantics.
+ * @st: current state.
+ * @ev: input event.
+ *
+ * - WAKE_IRQ always ends awake: the handler clears sleep_flag even when
+ *   it fires mid-SLEEP-wakeup (btmtk_irq.c:212-218) and the thread's
+ *   NORMAL_TR leg consumes rx_ind without leaving NORMAL
+ *   (btmtk_btif_main.c:1356-1360).
+ * - SLEEP_REQ enters sleep from NORMAL only (btmtk_btif_main.c:1420-1438:
+ *   FW-own set + enable IRQ + -> SLEEP); already asleep is a no-op.
+ * - WAKE_REQ always ends awake (btmtk_set_wakeup analogue).
+ * - FW_OWN_FAIL leaves the state UNCHANGED: the SLEEP wakeup leg
+ *   re-enables the IRQ and breaks out without changing psm->state
+ *   (btmtk_btif_main.c:1323-1342).
+ *
+ * Return: the next state.
+ */
+static inline enum btmtk_a32_psm
+btmtk_a32_psm_next(enum btmtk_a32_psm st, enum btmtk_a32_psm_ev ev)
+{
+	switch (ev) {
+	case BTMTK_A32_EV_WAKE_IRQ:
+		return BTMTK_A32_PSM_NORMAL;
+	case BTMTK_A32_EV_SLEEP_REQ:
+		return st == BTMTK_A32_PSM_NORMAL ?
+			BTMTK_A32_PSM_SLEEP : st;
+	case BTMTK_A32_EV_WAKE_REQ:
+		return BTMTK_A32_PSM_NORMAL;
+	case BTMTK_A32_EV_FW_OWN_FAIL:
+		return st;
+	}
+	return st;
+}
 
 /**
  * btmtk_a32_is_wmt_cmd - test for the WMT-over-HCI vendor header.

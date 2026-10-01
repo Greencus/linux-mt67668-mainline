@@ -59,6 +59,10 @@
 #include <linux/regulator/consumer.h>
 #include <linux/gpio/consumer.h>
 #include <linux/string.h>
+#include <linux/interrupt.h> /* §3: request_threaded_irq + IRQF_* */
+#include <linux/spinlock.h> /* §3: enable/disable active-flag lock */
+#include <linux/pm_wakeup.h> /* §3: wakeup_source + device_init_wakeup */
+#include <linux/pm.h> /* §3: SET_SYSTEM_SLEEP_PM_OPS */
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -117,12 +121,30 @@ struct btmtk_a32_dev {
 	 */
 	struct regulator *vcc;
 	struct gpio_desc *reset;
+	/* §3 wakeup-IRQ path (downstream btmtk_irq.c:39,211 shape). Both
+	 * IRQ numbers are DT-resolved (platform_get_irq_byname on the
+	 * interrupt-names from btmtk-a32.h); negative (-ENOENT/-EPROBE_DEFER
+	 * passthrough) when the fragment carries no numeric interrupts
+	 * property (expected until TODO-HWIRQ closes). Numbers are NEVER
+	 * hardcoded: the downstream MT_BGF2AP_*_ID 312/271 are marked
+	 * temp-only (btmtk_btif.h:61-62).
+	 */
+	int wake_irq; /* BGF2AP_BTIF_WAKEUP_IRQ analogue: FW has data */
+	int sw_irq; /* BGF2AP_SW_IRQ analogue: FW assert / FW-log notify */
+	spinlock_t irq_lock; /* guards *_active, cf. bt_irq_ctrl.lock */
+	bool wake_active;
+	bool sw_active;
+	struct wakeup_source *ws; /* "bt_psm" analogue (btmtk_btif.h:456) */
+	enum btmtk_a32_psm psm_state;
+	bool rx_pending; /* FW-data indication (g_bdev->rx_ind analogue) */
 };
 
 static int btmtk_a32_stub_send(struct device *dev, void *ctx,
 			       const u8 *data, unsigned int len);
 static int btmtk_a32_stub_open(struct device *dev, void *ctx);
 static void btmtk_a32_stub_close(struct device *dev, void *ctx);
+static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev);
+static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev);
 
 /* ------------------------------------------------------------------
  * RX path: H4 reassembly + demux, mirroring downstream h4_recv_buf()
@@ -326,6 +348,8 @@ static int btmtk_a32_open(struct hci_dev *hdev)
 	if (err < 0)
 		return err;
 
+	/* Force awake for the session (btmtk_set_wakeup analogue). */
+	btmtk_a32_set_wakeup(adev);
 	adev->opened = true;
 	return 0;
 }
@@ -341,6 +365,8 @@ static int btmtk_a32_close(struct hci_dev *hdev)
 	kfree_skb(adev->rx_skb);
 	adev->rx_skb = NULL;
 	adev->rx_target = 0;
+	/* Session over: re-arm FW-wakeup for the next one. */
+	btmtk_a32_set_sleep(adev);
 	return 0;
 }
 
@@ -480,6 +506,301 @@ static void btmtk_a32_power_init(struct btmtk_a32_dev *adev)
 }
 
 /* ------------------------------------------------------------------
+ * §3 wakeup-IRQ path: request_threaded_irq + handler + ack/clear +
+ * wakeup enable + sleep/wake hooks.
+ *
+ * Downstream shape preserved (btmtk_irq.c:39,211 + btmtk_mt66xx.c:1139):
+ * two logical IRQs (BTIF_WAKEUP = FW has data, SW = FW assert/log),
+ * request-then-mask at bring-up, disable-first handler that defers the
+ * real work, spinlock + active flag around enable/disable
+ * (btmtk_irq.c:303-352), and a "bt_psm"-style wakeup source plus
+ * device_init_wakeup/enable_irq_wake arming (wake precedent:
+ * wmt_plat_alps.c:633-636).
+ * ------------------------------------------------------------------
+ */
+
+/**
+ * btmtk_a32_irq_set() - mask/unmask one IRQ with active-flag tracking.
+ * @adev: driver context.
+ * @wakeup: true for the wakeup IRQ, false for the SW IRQ.
+ * @enable: true to enable, false to disable (nosync, handler-safe).
+ *
+ * Mirrors bt_enable_irq()/bt_disable_irq() (btmtk_irq.c:303-352): the
+ * spinlock + active flag make enable/disable idempotent so the handler
+ * (disable leg), the IRQ thread (re-arm leg) and the PSM hooks (arm on
+ * sleep entry at btmtk_btif_main.c:1435, mask on wakeup at :1322) cannot
+ * unbalance the core's enable depth.
+ */
+static void btmtk_a32_irq_set(struct btmtk_a32_dev *adev, bool wakeup,
+			      bool enable)
+{
+	unsigned long flags;
+	int irq;
+	bool *active;
+
+	spin_lock_irqsave(&adev->irq_lock, flags);
+	if (wakeup) {
+		irq = adev->wake_irq;
+		active = &adev->wake_active;
+	} else {
+		irq = adev->sw_irq;
+		active = &adev->sw_active;
+	}
+	if (irq < 0 || enable == *active) {
+		spin_unlock_irqrestore(&adev->irq_lock, flags);
+		return;
+	}
+	if (enable)
+		enable_irq(irq);
+	else
+		disable_irq_nosync(irq);
+	*active = enable;
+	spin_unlock_irqrestore(&adev->irq_lock, flags);
+}
+
+/**
+ * btmtk_a32_irq_ack() - acknowledge/clear a fired IRQ (mainline analogue).
+ * @adev: driver context.
+ * @irq: the fired IRQ number.
+ *
+ * Downstream ack/clear is CONNSYS-register based and has NO mainline
+ * analogue yet: bt_bgf2ap_irq_handler() reads BGF_SW_IRQ_STATUS and
+ * clears bits with SET_BIT(BGF_SW_IRQ_RESET_ADDR, ...) (btmtk_irq.c:151-
+ * 169); the BTIF-wakeup leg needs no CR clear because FW pushes its data
+ * over BTIF once the host clears FW-own (btmtk_btif_main.c:1356-1360).
+ * Those control registers live behind conninfra (TODO-CONNINFRA), so the
+ * mainline ack is mask-and-defer: disable_irq_nosync() FIRST -- the same
+ * call downstream makes first in its handler (btmtk_irq.c:213,220) --
+ * record the indication, clear the sleep flag via the PSM helper, and let
+ * the IRQ thread re-arm once the drain completes.
+ */
+static void btmtk_a32_irq_ack(struct btmtk_a32_dev *adev, int irq)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&adev->irq_lock, flags);
+	if (irq == adev->wake_irq && adev->wake_irq >= 0) {
+		if (adev->wake_active) {
+			disable_irq_nosync(adev->wake_irq);
+			adev->wake_active = false;
+		}
+		adev->rx_pending = true;
+		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+						    BTMTK_A32_EV_WAKE_IRQ);
+	} else if (irq == adev->sw_irq && adev->sw_irq >= 0) {
+		if (adev->sw_active) {
+			disable_irq_nosync(adev->sw_irq);
+			adev->sw_active = false;
+		}
+	}
+	spin_unlock_irqrestore(&adev->irq_lock, flags);
+}
+
+static irqreturn_t btmtk_a32_irq_handler(int irq, void *arg)
+{
+	struct btmtk_a32_dev *adev = arg;
+
+	/* Unknown line: IRQ_NONE, exactly as downstream (btmtk_irq.c:225). */
+	if (irq != adev->wake_irq && irq != adev->sw_irq)
+		return IRQ_NONE;
+	btmtk_a32_irq_ack(adev, irq);
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
+{
+	struct btmtk_a32_dev *adev = arg;
+
+	if (adev->ws)
+		__pm_wakeup_event(adev->ws, BTMTK_A32_WAKE_HOLD_MS);
+
+	if (irq == adev->wake_irq) {
+		/* FW has data (btmtk_irq.c:198). The offline stub has no RX
+		 * source, so the drain is: clear the indication, run pending
+		 * TX work, re-arm (the re-arm is the enable_irq() the
+		 * downstream thread path performs at btmtk_btif_main.c:1435
+		 * on sleep entry / after the wakeup completes).
+		 */
+		adev->rx_pending = false;
+		schedule_work(&adev->tx_work);
+		btmtk_a32_irq_set(adev, true, true);
+	} else {
+		/* SW IRQ: FW assert / FW-log notify (btmtk_irq.c:199). Reading
+		 * the status CR and driving reset/log handling needs conninfra
+		 * register access (TODO-CONNINFRA); offline we re-arm and note
+		 * it so no wakeup is ever lost-silent.
+		 */
+		dev_warn_ratelimited(adev->dev,
+				     "SW IRQ fired; status-CR handling deferred (TODO-CONNINFRA)\n");
+		btmtk_a32_irq_set(adev, false, true);
+	}
+	return IRQ_HANDLED;
+}
+
+/**
+ * btmtk_a32_set_sleep() - arm FW-wakeup and enter the SLEEP state.
+ * @adev: driver context.
+ *
+ * Host-side analogue of the downstream NORMAL_TR sleep leg
+ * (btmtk_btif_main.c:1420-1438: FW-own set, enable BTIF_WAKEUP_IRQ,
+ * -> SLEEP). The FW-own set itself needs the BTIF backend (TODO-BTIF);
+ * what this hook honors offline is the transition plus the IRQ arming.
+ */
+static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev)
+{
+	adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+					    BTMTK_A32_EV_SLEEP_REQ);
+	btmtk_a32_irq_set(adev, true, true);
+	return 0;
+}
+
+/**
+ * btmtk_a32_set_wakeup() - force awake (mask FW-wakeup, hold a wake event).
+ * @adev: driver context.
+ *
+ * Host-side analogue of btmtk_set_wakeup() (btmtk_mt66xx.c:1891) and the
+ * SLEEP wakeup leg (btmtk_btif_main.c:1320-1346: disable IRQ, FW-own
+ * clear, -> NORMAL_TR). The FW-own clear needs the BTIF backend
+ * (TODO-BTIF); offline this honors the transition, the IRQ mask (cf.
+ * btmtk_btif_main.c:1322) and a bounded wake hold standing in for the
+ * downstream "bt_psm" lock hold across the wakeup window.
+ */
+static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev)
+{
+	adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+					    BTMTK_A32_EV_WAKE_REQ);
+	btmtk_a32_irq_set(adev, true, false);
+	if (adev->ws)
+		__pm_wakeup_event(adev->ws, BTMTK_A32_WAKE_HOLD_MS);
+	return 0;
+}
+
+/**
+ * btmtk_a32_irq_request() - resolve and request the wakeup/SW IRQs.
+ * @adev: driver context (adev->dev must be the platform device).
+ *
+ * Resolution is DT-by-name (platform_get_irq_byname_optional), keeping the
+ * downstream index contract (btmtk_irq.c:249-269: 0 = wakeup, 1 = SW) in
+ * the fragment's interrupt-names order while never hardcoding a GIC
+ * number. Flags mirror downstream (IRQF_TRIGGER_HIGH | IRQF_SHARED,
+ * btmtk_irq.c:257,268); IRQF_ONESHOT is added because this driver serves
+ * the lines with request_threaded_irq (required for shared threaded
+ * lines). request_irq() devnames reuse the downstream .name strings
+ * (btmtk_irq.c:39-40) so traces match.
+ *
+ * Wakeup enable follows the sibling-driver precedent
+ * (wmt_plat_alps.c:633-636: request_irq "BTIF_WAKEUP_IRQ" then
+ * enable_irq_wake): device_init_wakeup(true) + enable_irq_wake() on the
+ * wakeup line. Masking via disable/enable_irq never clears the wake flag,
+ * so the line stays wake-capable while disarmed.
+ *
+ * Absent DT entries are NOT fatal: log once (TODO-HWIRQ) and continue --
+ * the node stays HARDWARE-UNPROVEN and the IRQ numbers stay uninvented.
+ */
+static void btmtk_a32_irq_request(struct btmtk_a32_dev *adev)
+{
+	struct platform_device *pdev = to_platform_device(adev->dev);
+	int irq, err;
+
+	spin_lock_init(&adev->irq_lock);
+	adev->wake_irq = -ENOENT;
+	adev->sw_irq = -ENOENT;
+	adev->wake_active = false;
+	adev->sw_active = false;
+	adev->psm_state = BTMTK_A32_PSM_NORMAL;
+	adev->rx_pending = false;
+
+	/* "bt_psm" analogue (btmtk_btif.h:456-461). */
+	adev->ws = wakeup_source_register(adev->dev, "btmtk-a32-psm");
+	if (!adev->ws)
+		dev_warn(adev->dev, "wakeup_source_register failed\n");
+
+	irq = platform_get_irq_byname_optional(pdev,
+					       BTMTK_A32_IRQ_NAME_WAKEUP);
+	if (irq < 0) {
+		dev_info(adev->dev,
+			 "no '%s' IRQ in DT (TODO-HWIRQ: numeric CONNSYS->GIC routing unconfirmed)\n",
+			 BTMTK_A32_IRQ_NAME_WAKEUP);
+	} else {
+		err = devm_request_threaded_irq(adev->dev, irq,
+						btmtk_a32_irq_handler,
+						btmtk_a32_irq_thread,
+						IRQF_TRIGGER_HIGH | IRQF_SHARED |
+						IRQF_ONESHOT,
+						BTMTK_A32_IRQ_DEVNAME_WAKEUP,
+						adev);
+		if (err) {
+			dev_warn(adev->dev, "wakeup IRQ %d request failed (%d)\n",
+				 irq, err);
+		} else {
+			adev->wake_irq = irq;
+			adev->wake_active = true;
+			device_init_wakeup(adev->dev, true);
+			err = enable_irq_wake(irq);
+			if (err)
+				dev_warn(adev->dev,
+					 "enable_irq_wake(%d) failed (%d)\n",
+					 irq, err);
+			/* Start masked, as downstream does right after
+			 * requesting (btmtk_mt66xx.c:1143,1149); the PSM
+			 * sleep entry arms the line.
+			 */
+			btmtk_a32_irq_set(adev, true, false);
+		}
+	}
+
+	irq = platform_get_irq_byname_optional(pdev, BTMTK_A32_IRQ_NAME_SW);
+	if (irq < 0) {
+		dev_info(adev->dev,
+			 "no '%s' IRQ in DT (TODO-HWIRQ: numeric CONNSYS->GIC routing unconfirmed)\n",
+			 BTMTK_A32_IRQ_NAME_SW);
+	} else {
+		err = devm_request_threaded_irq(adev->dev, irq,
+						btmtk_a32_irq_handler,
+						btmtk_a32_irq_thread,
+						IRQF_TRIGGER_HIGH | IRQF_SHARED |
+						IRQF_ONESHOT,
+						BTMTK_A32_IRQ_DEVNAME_SW,
+						adev);
+		if (err) {
+			dev_warn(adev->dev, "SW IRQ %d request failed (%d)\n",
+				 irq, err);
+		} else {
+			adev->sw_irq = irq;
+			adev->sw_active = true;
+			/* Same request-then-mask policy (btmtk_mt66xx.c:1149). */
+			btmtk_a32_irq_set(adev, false, false);
+		}
+	}
+}
+
+/**
+ * btmtk_a32_irq_free() - undo the wakeup enable from btmtk_a32_irq_request().
+ * @adev: driver context.
+ *
+ * The devm_request_threaded_irq() registrations release automatically;
+ * what needs explicit undo is the wake arming plus the wakeup source
+ * (downstream frees both IRQs at btmtk_mt66xx.c:1190-1191).
+ */
+static void btmtk_a32_irq_free(struct btmtk_a32_dev *adev)
+{
+	if (adev->wake_irq >= 0) {
+		disable_irq_wake(adev->wake_irq);
+		adev->wake_irq = -ENOENT;
+		adev->wake_active = false;
+	}
+	if (adev->sw_irq >= 0) {
+		adev->sw_irq = -ENOENT;
+		adev->sw_active = false;
+	}
+	device_init_wakeup(adev->dev, false);
+	if (adev->ws) {
+		wakeup_source_unregister(adev->ws);
+		adev->ws = NULL;
+	}
+}
+
+/* ------------------------------------------------------------------
  * Platform probe/remove + module boilerplate.
  * ------------------------------------------------------------------
  */
@@ -508,6 +829,11 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	adev->transport.ctx = adev;
 
 	btmtk_a32_power_init(adev);
+
+	/* §3: DT-by-name IRQ resolution. Optional until TODO-HWIRQ closes;
+	 * absence only logs, never fails probe (offline-safe).
+	 */
+	btmtk_a32_irq_request(adev);
 
 	hdev = hci_alloc_dev();
 	if (!hdev)
@@ -552,7 +878,36 @@ static void btmtk_a32_remove(struct platform_device *pdev)
 	cancel_work_sync(&adev->tx_work);
 	hci_unregister_dev(adev->hdev);
 	hci_free_dev(adev->hdev);
+	btmtk_a32_irq_free(adev);
 }
+
+static int __maybe_unused btmtk_a32_suspend(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct btmtk_a32_dev *adev = platform_get_drvdata(pdev);
+
+	/* Suspend follows the downstream sleep-entry direction
+	 * (btmtk_btif_main.c:1420-1438): arm the FW-wakeup line so firmware
+	 * data wakes the host. The enable_irq_wake() arming from probe
+	 * persists, so the (masked) line stays wake-capable here.
+	 */
+	return btmtk_a32_set_sleep(adev);
+}
+
+static int __maybe_unused btmtk_a32_resume(struct device *dev)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct btmtk_a32_dev *adev = platform_get_drvdata(pdev);
+
+	/* Resume follows the wakeup direction (btmtk_btif_main.c:1320-1346):
+	 * take the FW-wakeup mask back and hold a bounded wake event.
+	 */
+	return btmtk_a32_set_wakeup(adev);
+}
+
+static const struct dev_pm_ops btmtk_a32_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(btmtk_a32_suspend, btmtk_a32_resume)
+};
 
 static const struct of_device_id btmtk_a32_of_match[] = {
 	{ .compatible = "mediatek,mt6768-bt-a32" },
@@ -566,6 +921,7 @@ static struct platform_driver btmtk_a32_driver = {
 	.driver = {
 		.name = BTMTK_A32_DRVNAME,
 		.of_match_table = btmtk_a32_of_match,
+		.pm = &btmtk_a32_pm_ops,
 	},
 };
 module_platform_driver(btmtk_a32_driver);

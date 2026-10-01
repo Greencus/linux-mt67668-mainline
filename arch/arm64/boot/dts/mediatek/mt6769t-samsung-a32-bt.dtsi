@@ -22,6 +22,32 @@
  * vcc-supply / reset-gpios are left ABSENT; the driver treats both as
  * optional and logs TODO-POWER when missing. Uncomment and fill them
  * only from measured/vendor-derived values.
+ *
+ * Wakeup IRQ (§3): downstream resolves BOTH BT logical IRQs from DT --
+ * irq_of_parse_and_map() on compatible "mediatek,bt", index 0 =
+ * BTIF_WAKEUP_IRQ (FW has data) / index 1 = BGF_SW_IRQ (FW assert/log)
+ * with IRQF_TRIGGER_HIGH|IRQF_SHARED (connac2/btmtk_irq.c:239-290), named
+ * "BTIF_WAKEUP_IRQ"/"BGF_SW_IRQ" (btmtk_irq.c:39-40), owner CONSYS_BT
+ * (btmtk_btif_main.c:46), requested-then-masked at bring-up
+ * (btmtk_mt66xx.c:1139-1149). Mainline routing substrate here is the MT6768
+ * GIC-V3 + sysirq intpol + pinctrl-mt6768 EINT (mt6768.dtsi: root
+ * interrupt-parent = <&sysirq>, gic node, pio pinctrl@10005000); the
+ * interrupt-parent for this node is INHERITED from / (mt6768.dtsi:19),
+ * so no interrupt-parent is written here.
+ *
+ * TODO-HWIRQ (hardware-confirm, blocks "okay"): NO numeric `interrupts`
+ * property is written -- none is evidenced for A32. Downstream's own
+ * "mediatek,bt" nodes carry NO interrupts property at all (e.g.
+ * downstream mt6833/mt6853.dts: only pm_qos_support); the sibling
+ * "mediatek,btif" SPIs on OTHER SoCs (e.g. GIC_SPI 158/152/153 on mt6833)
+ * are not A32 evidence; the MT_BGF2AP_BTIF_WAKEUP_IRQ_ID 312 /
+ * MT_BGF2AP_SW_IRQ_ID 271 constants are downstream-marked "temp"
+ * (btmtk_btif.h:61-62); and mainline mt6768.dtsi has NO consys/btif/bt
+ * node to inherit a number from. The numeric specifiers (in
+ * interrupt-names order: wakeup first, SW second) land here ONLY from a
+ * hardware-confirmed A32 CONNSYS->GIC/sysirq routing. Until then the
+ * driver resolves both lines by name and keeps them unarmed
+ * (HARDWARE-UNPROVEN).
  */
 
 / {
@@ -37,6 +63,15 @@
 		 * on A32 silicon. Flip to "okay" only then.
 		 */
 		status = "disabled";
+
+		/* §3 wakeup-IRQ binding (names only; numeric resolution is
+		 * TODO-HWIRQ above -- deliberately NO `interrupts` property
+		 * until the A32 routing is hardware-confirmed). Order follows
+		 * the downstream DTS indices (btmtk_irq.c:249-269): index 0 =
+		 * wakeup (FW has data), index 1 = SW (FW assert/log).
+		 */
+		interrupt-names = "wakeup", "sw";
+		wakeup-source;
 
 		/* Firmware consumed (short basenames, no mediatek/ prefix;
 		 * expected under /lib/firmware/ -- cf. btmtk-a32.h):
