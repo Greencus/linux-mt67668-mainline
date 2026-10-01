@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Source for Samsung Galaxy A32 (SM-A325F, MT6768 family)
+ *
+ * Bring-up board file. Minimal-first: only blocks with A32 evidence are
+ * enabled. Everything board-specific without evidence is OMITTED with a
+ * TODO (never copied from Redmi boards).
+ *
+ * Tag legend (trailing comment on every board-level property):
+ *   SoC-common | board-specific | vendor-derived | measured | inferred
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include "mt6769t.dtsi" /* pulls mt6768.dtsi + 1.8GHz cluster0 OPP */ /* SoC-common */
+#include "mt6358.dtsi" /* MT6358 companion PMIC, measured on this unit */ /* measured */
+
+&{/} {
+	model = "Samsung Galaxy A32"; /* board-specific */
+	compatible = "samsung,a32", "mediatek,mt6769t", "mediatek,mt6768"; /* board-specific */
+
+	aliases {
+		serial0 = &uart0; /* board-specific */
+	};
+
+	chosen {
+		stdout-path = &uart0; /* board-specific: serial console; framebuffer path lands here once TODO-G (LK FB addr) closes */
+	};
+
+	memory@40000000 {
+		device_type = "memory"; /* SoC-common */
+		/* 4GB unit: ro.boot.dram_info=4096MB + ddr_size measured; bootloader
+		 * refines usable (MemTotal 3732920kB). Full 4GB described; LK trims. */
+		reg = <0x0 0x40000000 0x1 0x0>; /* measured */
+	};
+};
+
+&auxadc {
+	status = "okay"; /* SoC-common: ADC block, no board wiring */
+};
+
+&thermal {
+	status = "okay"; /* SoC-common: thermal zones via SoC sensors */
+};
+
+/* PMIC interrupt GPIO: xiaomi uses pio144 — NOT copied (board-specific, A32
+ * value unknown). SoC default stands until measured. TODO-PMIC-IRQ. */
+
+&mt6358_vdram2_reg {
+	regulator-always-on; /* inferred: DRAM rail, required by memory node above */
+};
+
+&cci {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred: little-cluster rail, family pattern */
+};
+
+&cpu0 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu1 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu2 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu3 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu4 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu5 {
+	proc-supply = <&mt6358_vproc12_reg>; /* inferred */
+};
+
+&cpu6 {
+	proc-supply = <&mt6358_vproc11_reg>; /* inferred: big-cluster rail, family pattern */
+};
+
+&cpu7 {
+	proc-supply = <&mt6358_vproc11_reg>; /* inferred */
+};
+
+&uart0 {
+	status = "okay"; /* board-specific: console UART */
+};
+
+/* USB: sys.usb.controller=musb-hdrc measured; musb+tphy shape. Generic
+ * mainline port graph only. Redmi typec connector (willsemi,wusb3801) NOT
+ * copied — A32 TCPC unknown. TODO-USB-ROLE. */
+&usb2 {
+	status = "okay"; /* measured */
+
+	ports {
+		#address-cells = <1>; /* SoC-common */
+		#size-cells = <0>; /* SoC-common */
+
+		port@0 {
+			usb2phy_port: endpoint {
+				/* remote-endpoint: typec connector, TODO-USB-ROLE */ /* board-specific */
+			};
+		};
+		port@1 {
+			usb_phy_ep: endpoint {
+				remote-endpoint = <&phy_sw_ep>; /* SoC-common */
+			};
+		};
+	};
+};
+
+&usb2port0 {
+	mediatek,software-role-switch; /* inferred: role-switch until TCPC known */
+
+	port {
+		phy_sw_ep: endpoint {
+			remote-endpoint = <&usb_phy_ep>; /* SoC-common */
+		};
+	};
+};
+
+&usb2phy {
+	status = "okay"; /* measured: tphy present */
+};
+
+/* Keyboard/volume keys: merlin MATRIX_KEY VOLUMEDOWN on kprow/col0 NOT copied
+ * (Redmi specifics). Server needs no keys. TODO-KEYS if ever wanted. */
+
+&mipi_tx0 {
+	status = "okay"; /* SoC-common: DSI PHY block, inert until dsi0 enabled */
+};
+
+/* eMMC: measured (11230000.msdc, mmcblk0 boot device, mtk_emmc_support=1).
+ * Conservative first bring-up: HS200 only. HS400 + hs400-ds-delay are
+ * board delay-line tuning — NOT copied, TODO-MMC-HS400. Pinmux omitted:
+ * LK leaves MSDC0 muxed (boot device); Linux reuses reset state. TODO-MMC-PIN. */
+&mmc0 {
+	status = "okay"; /* measured */
+	bus-width = <8>; /* measured: eMMC (JEDEC 8-bit) */
+	max-frequency = <200000000>; /* inferred: HS200 ceiling for bring-up */
+	cap-mmc-highspeed; /* SoC-common */
+	mmc-ddr-1_8v; /* SoC-common */
+	mmc-hs200-1_8v; /* inferred: bring-up ceiling (see HS400 TODO above) */
+	cap-mmc-hw-reset; /* SoC-common */
+	no-sdio; /* board-specific: eMMC slot, no SDIO */
+	no-sd; /* board-specific: eMMC slot, no SD */
+	non-removable; /* board-specific: soldered eMMC */
+	supports-cqe; /* SoC-common: command queue engine */
+	vmmc-supply = <&mt6358_vemc_reg>; /* vendor-derived: eMMC power rail, family pattern */
+	vqmmc-supply = <&mt6358_vio18_reg>; /* vendor-derived: eMMC IO rail, family pattern */
+};
+
+/* mmc1 (SD slot): merlin cd-gpios pio18 NOT copied (Redmi-specific).
+ * A32 slot presence + card-detect GPIO unknown. OMITTED. TODO-SD. */
+
+&gpu {
+	status = "okay"; /* inferred: G52 present (0x13040000, 2EE) */
+	mali-supply = <&mt6358_vgpu_reg>; /* inferred: family pattern (xiaomi-common:208) */
+};
+
+&mt6358_vgpu_reg {
+	regulator-max-microvolt = <950000>; /* inferred: family pattern (xiaomi-common:212) */
+	regulator-always-on; /* inferred */
+	regulator-boot-on; /* inferred */
+
+	regulator-coupled-with = <&mt6358_vsram_gpu_reg>; /* inferred: family pattern */
+	regulator-coupled-max-spread = <100000>; /* inferred: family pattern */
+};
+
+&mt6358_vsram_gpu_reg {
+	regulator-min-microvolt = <850000>; /* inferred: family pattern */
+	regulator-max-microvolt = <1050000>; /* inferred: family pattern */
+	regulator-always-on; /* inferred */
+	regulator-boot-on; /* inferred */
+
+	regulator-coupled-with = <&mt6358_vgpu_reg>; /* inferred: family pattern */
+	regulator-coupled-max-spread = <100000>; /* inferred: family pattern */
+};
+
+&mfg_async {
+	domain-supply = <&mt6358_vsram_gpu_reg>; /* inferred: family pattern */
+};
+
+&mfg {
+	domain-supply = <&mt6358_vgpu_reg>; /* inferred: family pattern */
+};
+
+/* DSI + panel: downstream proves Samsung s6e3fc3, DSI CMD 4-lane, 1080x2400
+ * (display_lcd_a32_common.dtsi). panel-simple timings + init-seq UNKNOWN, so
+ * the panel below is a FAIL-SAFE STUB: non-matching compatible (never binds),
+ * status disabled, NO invented timings. TODO-PANEL to enable. */
+&dsi0 {
+	status = "disabled"; /* board-specific: stays off until TODO-PANEL closes */
+	#address-cells = <1>; /* SoC-common */
+	#size-cells = <0>; /* SoC-common */
+
+	a32_panel_stub: panel@0 {
+		/* STUB: compatible matches NO driver (intentional). Real entry lands
+		 * here once init-seq + timings are captured. TODO-PANEL. */
+		compatible = "samsung,a32-panel-stub"; /* board-specific */
+		reg = <0>; /* SoC-common */
+		/* Vendor-derived LCD GPIOs (downstream display_lcd_a32_common.dtsi),
+		 * recorded here, wired when the real entry lands:
+		 * LCD_RST=pio45, LCD_1P8_EN=pio25, LCD_3P0_EN=pio153,
+		 * CON_DET=pio92, ESD_DET=pio179, PCD_DET=pio54, ERR_FG=pio28. */
+		reset-gpios = <&pio 45 GPIO_ACTIVE_HIGH>; /* vendor-derived */
+		status = "disabled"; /* board-specific: FAIL SAFE */
+
+		port {
+			a32_panel_in: endpoint {
+				remote-endpoint = <&dsi_out>; /* SoC-common */
+			};
+		};
+	};
+};
+
+&dsi_out {
+	remote-endpoint = <&a32_panel_in>; /* SoC-common */
+};
+
+/* OMITTED (no A32 evidence — each a TODO, none copied from Redmi):
+ * gpio-leds/flashlight (pio152/153 Redmi-specific) TODO-LEDS;
+ * i2c0 KTD3137 backlight (Redmi addr/tuning) TODO-BL;
+ * i2c3 NXP PN553 NFC (Redmi wiring) TODO-NFC;
+ * i2c5 mt6370 charger/backlight/indicator/flashlight + dsv/vibldo (Redmi PMIC companions) TODO-PMIC2;
+ * i2c7 willsemi TCPC (Redmi-specific) TODO-USB-ROLE;
+ * spi0 nt36672a touch + spi3 cs35l41 amp (Redmi peripherals) TODO-TOUCH TODO-AUDIO;
+ * devapc/dvfsrc enables (left at SoC default) TODO-DVFS;
+ * mmc1 SD slot (cd-gpio unknown) TODO-SD;
+ * memory reservations beyond memory@ (modem/scp carveouts unknown) TODO-MEMRSV.
+ */
