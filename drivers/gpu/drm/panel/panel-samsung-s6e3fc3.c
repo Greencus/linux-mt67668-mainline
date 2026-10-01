@@ -40,12 +40,18 @@
  * (s6e3fc3_a32.c:50 LEVEL_IS_HBM). */
 #define S6E3FC3_LEVEL_IS_HBM(br)	((br) > S6E3FC3_UI_MAX_BRIGHTNESS)
 
-/* Panel rev gating (s6e3fc3_a32.c:1394, panel_rev = lcdtype & 0xFF).
- * Live-measured unit reports ID 0x800004, i.e. rev 4, so only the rev>=3
- * code paths are ported here. The rev<3 paths (DIM_GPARA+DIM table at
- * s6e3fc3_a32.c:548-551, brightness_table_id_00_02, LCD_SEQ_INIT_00_02)
- * are NOT-YET-IMPLEMENTED: no rev<3 unit to validate against. */
-#define S6E3FC3_PANEL_REV		4
+/* Panel rev gating (s6e3fc3_a32.c:1394, panel_rev = lcdtype & 0xFF;
+ * probe selects brightness_table_id_00_02 for rev<3 else id_03 at :1396-1406,
+ * with probe FPS_60 default at :1409).
+ * Live-measured unit reports ID 0x800004, i.e. rev 4, so the driver defaults
+ * to rev 4 (rev>=3 gamma + SYNC path). The rev<3 tables (gamma id_00_02 +
+ * DIM_GPARA/DIM path at s6e3fc3_a32.c:548-551) are ported byte-exact but
+ * HARDWARE-UNPROVEN: no rev<3 unit exists to validate against.
+ * LCD_SEQ_INIT_00_02 (param.h:1329-1355) is sequence-identical to
+ * LCD_SEQ_INIT_03 (param.h:1357-1383) -- same 23 SEQs in the same order
+ * (only the unbuilt CONFIG_SEC_FACTORY FD pair is listed) -- so the single
+ * init path below serves both revs exactly. */
+#define S6E3FC3_PANEL_REV_DEFAULT	4
 
 /* DCS register addresses (s6e3fc3_a32_param.h:25-31). */
 #define S6E3FC3_REG_BRIGHTNESS		0x51
@@ -81,12 +87,20 @@ struct s6e3fc3 {
 	struct regulator_bulk_data supplies[2];
 	struct gpio_desc *reset_gpio;
 
-	/* Downstream lcd->fps probe default is FPS_60 (s6e3fc3_a32.c:1409);
-	 * the 90Hz dfps level (display_lcd_a32_common.dtsi:120-125) is
-	 * exposed as a mode but there is no evidence for the live boot
-	 * default beyond the probe value, so boot at 60Hz. Per-mode FPS
-	 * switching is NOT-YET-IMPLEMENTED (no mode-switch hook updates
-	 * this; see get_modes). */
+	/* Real revision mechanism (s6e3fc3_a32.c:1394-1409): panel_rev selects
+	 * the gamma table (rev<3 -> id_00_02 else id_03) and the DIM-vs-SYNC
+	 * branch; probe default is FPS_60. panel_rev defaults to the
+	 * live-measured rev 4 (ID 0x800004); fps_90 defaults to false (60Hz)
+	 * through the vrefresh mapping at probe (see s6e3fc3_switch_fps). */
+	unsigned int panel_rev;
+
+	/* Downstream lcd->fps (s6e3fc3_a32.c:1409, :2767-2792): false = FPS_60,
+	 * true = FPS_90. Re-programmed from this state on every prepare()
+	 * (panel_init -> brightness path) and every backlight update, so a
+	 * full modeset (the normal DRM mode-setting path for DSI panels:
+	 * disable -> unprepare -> prepare -> enable) re-issues the FPS DCS
+	 * for the stored level; s6e3fc3_switch_fps() is the single choke point
+	 * that translates a mode's vrefresh into this state. */
 	bool fps_90;
 };
 
@@ -141,8 +155,8 @@ static int s6e3fc3_test_key_off_fc(struct s6e3fc3 *ctx)
 }
 
 /* --- init-table helpers (LCD_SEQ_INIT_03, param.h:1357-1383) ---
- * Rev>=3 init table (live unit is rev 4). LCD_SEQ_INIT_00_02
- * (param.h:1329-1355, rev<3) is NOT ported, see S6E3FC3_PANEL_REV. */
+ * LCD_SEQ_INIT_00_02 (param.h:1329-1355, rev<3) is sequence-identical,
+ * so this serves both revs; see S6E3FC3_PANEL_REV_DEFAULT. */
 static int s6e3fc3_global_para_set(struct s6e3fc3 *ctx)
 {
 	/* SEQ_S6E3FC3_GLOBAL_PARA_SET (param.h:204-212) */
@@ -228,7 +242,96 @@ static int s6e3fc3_te_on(struct s6e3fc3 *ctx)
 	return 0;
 }
 
+/* --- self-mask SRAM upload (s6e3fc3_a32.c:1164-1174) ---
+ * Complete payload is present in-repo (s6e3fc3_a32_selfmask.h): DISABLE
+ * (0x7A,0x00), 17-18ms, SD_PATH (0x75,0x10), 1-2ms, IMG transfer via DCS
+ * 0x4C/0x5C chunking (s6e3fc3_a32.c:212-244), 1-2ms, SD_PATH_OFF (0x75,0x00),
+ * ENABLE. ENABLE bytes are the non-FACTORY variant (selfmask.h #else
+ * branch); the CONFIG_SEC_FACTORY variant is NOT ported (no factory build).
+ * Runtime mask control (mask-layer sysfs brightness / HBM<->normal VINT
+ * transitions / framedone coupling at s6e3fc3_a32.c:2540-2560, CRC + DBIST
+ * debug images) has no DRM consumer and is NOT ported: no vendor sysfs
+ * mask ABI here. */
+static int s6e3fc3_self_mask_disable(struct s6e3fc3 *ctx)
+{
+	/* SEQ_S6E3FC3_SELF_MASK_DISABLE (selfmask.h:36-39) */
+	s6e3fc3_dcs_write_seq_static(ctx, 0x7a, 0x00);
+	return 0;
+}
+
+static int s6e3fc3_self_mask_sd_path(struct s6e3fc3 *ctx)
+{
+	/* SEQ_S6E3FC3_SELF_MASK_SD_PATH (selfmask.h:14-17) */
+	s6e3fc3_dcs_write_seq_static(ctx, 0x75, 0x10);
+	return 0;
+}
+
+static int s6e3fc3_self_mask_sd_path_off(struct s6e3fc3 *ctx)
+{
+	/* SEQ_S6E3FC3_SELF_MASK_SD_PATH_OFF (selfmask.h:19-22) */
+	s6e3fc3_dcs_write_seq_static(ctx, 0x75, 0x00);
+	return 0;
+}
+
+static int s6e3fc3_self_mask_enable(struct s6e3fc3 *ctx)
+{
+	/* SEQ_S6E3FC3_SELF_MASK_ENABLE, non-FACTORY variant
+	 * (selfmask.h:24-35, #else branch at :30-33). */
+	s6e3fc3_dcs_write_seq_static(ctx, 0x7a,
+		0x01, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95,
+		0x07, 0x9e, 0x09, 0x5f, 0x09, 0x0c);
+	return 0;
+}
+
+static int s6e3fc3_self_mask_upload(struct s6e3fc3 *ctx)
+{
+	/* smcdsd_dsi_tx_img_sd chunking (s6e3fc3_a32.c:212-244): the first
+	 * transfer opens with MIPI_DCS_WRITE_SIDE_RAM_START (0x4C),
+	 * continuations use MIPI_DCS_WRITE_SIDE_RAM_CONTINUE (0x5C); each
+	 * payload is capped at DSIM_MAX_FIFO-1 (490B) and rounded down to
+	 * SRAM_BYTE_ALIGN (16B). 3536 = 7x480 + 176, both 16-aligned. */
+	u8 chunk[490 + 1];
+	size_t len = 0, remain, tx;
+	int ret;
+
+	while (len < ARRAY_SIZE(s6e3fc3_self_mask_img)) {
+		remain = ARRAY_SIZE(s6e3fc3_self_mask_img) - len;
+		tx = remain > sizeof(chunk) - 1 ? sizeof(chunk) - 1 : remain;
+		tx -= tx % 16;
+		chunk[0] = (len == 0) ? 0x4c : 0x5c;
+		memcpy(&chunk[1], &s6e3fc3_self_mask_img[len], tx);
+		ret = s6e3fc3_dcs_write(ctx, chunk, tx + 1);
+		if (ret < 0)
+			return ret;
+		len += tx;
+	}
+
+	return 0;
+}
+
 /* --- brightness-path helpers (low_level_set_brightness, s6e3fc3_a32.c:776) --- */
+
+/* DFPS mode -> FPS-level mapping for the 1080x2400 DFPS pair
+ * (display_lcd_a32_common.dtsi:120-125, available_fps 6000+9000).
+ * 60Hz -> FPS_60HZ (0x60,0x00,0x00, param.h:291-294),
+ * 90Hz -> FPS_90HZ (0x60,0x08,0x00, param.h:296-299); anything else is
+ * rejected. (The MTK-cmdq seamless variants at s6e3fc3_a32.c:2693-2715 carry
+ * one extra trailing 0x00 on the 0x60 write; the leading register bytes are
+ * identical, and the brightness path below uses the SEQ form.) */
+static int s6e3fc3_fps_90_for_vrefresh(unsigned int vrefresh, bool *fps_90)
+{
+	switch (vrefresh) {
+	case 60:
+		*fps_90 = false;
+		return 0;
+	case 90:
+		*fps_90 = true;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
 
 static int s6e3fc3_set_fps(struct s6e3fc3 *ctx)
 {
@@ -269,6 +372,31 @@ static int s6e3fc3_set_sync(struct s6e3fc3 *ctx, unsigned int brightness)
 	else
 		s6e3fc3_dcs_write_seq_static(ctx, 0x63, 0x60);
 	return 0;
+}
+
+static int s6e3fc3_set_dim(struct s6e3fc3 *ctx, unsigned int brightness)
+{
+	/* Rev<3 branch of smcdsd_panel_set_wrctrld (s6e3fc3_a32.c:548-551):
+	 * DIM_GPARA (param.h:326-329) + DIM_TABLE[hbm] (param.h:331-339,
+	 * selected at :714) = NORMAL_DIM (0x90,0x1C, :331-334) for normal,
+	 * HBM_DIM (0x90,0x14, :336-339) for HBM.
+	 * HARDWARE-UNPROVEN (no rev<3 unit); the live rev-4 unit takes SYNC. */
+	s6e3fc3_dcs_write_seq_static(ctx, 0xb0, 0x00, 0x02, 0x90);
+	if (S6E3FC3_LEVEL_IS_HBM(brightness))
+		s6e3fc3_dcs_write_seq_static(ctx, 0x90, 0x14);
+	else
+		s6e3fc3_dcs_write_seq_static(ctx, 0x90, 0x1c);
+	return 0;
+}
+
+static int s6e3fc3_set_dim_or_sync(struct s6e3fc3 *ctx, unsigned int brightness)
+{
+	/* wrctrld rev gate (s6e3fc3_a32.c:548-565): rev<3 -> DIM path,
+	 * rev>=3 -> SYNC path (the force_normal_transition VINT sub-branch
+	 * is mask-layer-only and has no DRM consumer; see set_sync). */
+	if (ctx->panel_rev < 3)
+		return s6e3fc3_set_dim(ctx, brightness);
+	return s6e3fc3_set_sync(ctx, brightness);
 }
 
 static int s6e3fc3_set_elvss(struct s6e3fc3 *ctx)
@@ -314,9 +442,20 @@ static int s6e3fc3_set_aor(struct s6e3fc3 *ctx, unsigned int brightness)
 	return 0;
 }
 
+static const u16 *s6e3fc3_gamma_table_for_rev(const struct s6e3fc3 *ctx)
+{
+	/* Probe gamma selection (s6e3fc3_a32.c:1396-1406):
+	 * rev<3 -> brightness_table_id_00_02 (param.h:731-782),
+	 * else -> brightness_table_id_03 (param.h:785-836).
+	 * Normal range 0..256 is identical in both; the HBM ramps differ. */
+	if (ctx->panel_rev < 3)
+		return s6e3fc3_gamma_table_rev02;
+	return s6e3fc3_gamma_table;
+}
+
 static int s6e3fc3_set_gamma(struct s6e3fc3 *ctx, unsigned int brightness)
 {
-	u16 level = s6e3fc3_gamma_table[brightness];
+	u16 level = s6e3fc3_gamma_table_for_rev(ctx)[brightness];
 	u8 data[3];
 
 	/* smcdsd_panel_set_wrctrld bl_reg pack (s6e3fc3_a32.c:541-543,
@@ -339,7 +478,7 @@ static int s6e3fc3_low_level_set_brightness(struct s6e3fc3 *ctx,
 	 * which never fire without a mask layer. */
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_on_f0(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_set_fps(ctx));
-	s6e3fc3_call_write_func(ret, s6e3fc3_set_sync(ctx, brightness));
+	s6e3fc3_call_write_func(ret, s6e3fc3_set_dim_or_sync(ctx, brightness));
 	s6e3fc3_call_write_func(ret, s6e3fc3_set_hbm(ctx, brightness));
 	s6e3fc3_call_write_func(ret, s6e3fc3_set_gamma(ctx, brightness));
 	s6e3fc3_call_write_func(ret, s6e3fc3_set_elvss(ctx));
@@ -349,6 +488,34 @@ static int s6e3fc3_low_level_set_brightness(struct s6e3fc3 *ctx,
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_off_f0(ctx));
 
 	return 0;
+}
+
+static int s6e3fc3_switch_fps(struct s6e3fc3 *ctx, unsigned int vrefresh)
+{
+	bool fps_90;
+	int ret;
+
+	/* Mode-switch entry point for the DFPS pair: translate the new mode's
+	 * vrefresh into the FPS level (invalid modes rejected above), then
+	 * re-program the FPS register through the FULL downstream brightness
+	 * order (s6e3fc3_a32.c:776-800) so brightness/HBM/ACL/AOR/gamma/sync/
+	 * ELVSS are preserved across the switch. While the panel is off the
+	 * level is recorded for the next prepare(), exactly like set_brightness
+	 * below. No vendor sysfs FPS forcer, no MTK cmdq: the normal DRM
+	 * modeset drives this (full modeset re-runs prepare() -> panel_init()
+	 * -> brightness path from the stored level). Display behavior
+	 * HARDWARE-UNPROVEN. */
+	ret = s6e3fc3_fps_90_for_vrefresh(vrefresh, &fps_90);
+	if (ret < 0)
+		return ret;
+
+	ctx->fps_90 = fps_90;
+
+	if (ctx->bl_dev->props.power != BACKLIGHT_POWER_ON)
+		return 0;
+
+	return s6e3fc3_low_level_set_brightness(ctx,
+					       ctx->bl_dev->props.brightness);
 }
 
 static int s6e3fc3_get_brightness(struct backlight_device *bl_dev)
@@ -390,8 +557,7 @@ static int s6e3fc3_panel_init(struct s6e3fc3 *ctx)
 
 	/* s6e3fc3_init (s6e3fc3_a32.c:1141-1184), minus the DCS reads (ID at
 	 * :1146, init_info at :1181 -- TODO-BLOCKED, no verified ID on a
-	 * mainline-probed unit) and minus the selfmask SRAM upload
-	 * (:1164-1174, TODO-BLOCKED on the selfmask image payload).
+	 * mainline-probed unit).
 	 * The 10ms settle after the (omitted) ID read (:1148) is kept for
 	 * panel timing, same rationale as the kept 90ms delay below. */
 	usleep_range(10000, 11000);
@@ -405,7 +571,9 @@ static int s6e3fc3_panel_init(struct s6e3fc3 *ctx)
 
 	usleep_range(30000, 31000);
 
-	/* LCD_SEQ_INIT_03, the rev>=3 init table (param.h:1357-1383). */
+	/* LCD_SEQ_INIT_03, the rev>=3 init table (param.h:1357-1383);
+	 * sequence-identical to LCD_SEQ_INIT_00_02 (param.h:1329-1355),
+	 * so this serves both revs (see S6E3FC3_PANEL_REV_DEFAULT). */
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_on_f0(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_on_fc(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_global_para_set(ctx));
@@ -419,6 +587,20 @@ static int s6e3fc3_panel_init(struct s6e3fc3 *ctx)
 	s6e3fc3_call_write_func(ret, s6e3fc3_ltps_update(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_te_on(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_off_fc(ctx));
+	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_off_f0(ctx));
+
+	/* Self-mask SRAM upload (s6e3fc3_a32.c:1164-1174), in downstream
+	 * order: DISABLE, 17-18ms, SD_PATH, 1-2ms, IMG, 1-2ms, SD_PATH_OFF,
+	 * ENABLE. */
+	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_on_f0(ctx));
+	s6e3fc3_call_write_func(ret, s6e3fc3_self_mask_disable(ctx));
+	usleep_range(17000, 18000);
+	s6e3fc3_call_write_func(ret, s6e3fc3_self_mask_sd_path(ctx));
+	usleep_range(1000, 2000);
+	s6e3fc3_call_write_func(ret, s6e3fc3_self_mask_upload(ctx));
+	usleep_range(1000, 2000);
+	s6e3fc3_call_write_func(ret, s6e3fc3_self_mask_sd_path_off(ctx));
+	s6e3fc3_call_write_func(ret, s6e3fc3_self_mask_enable(ctx));
 	s6e3fc3_call_write_func(ret, s6e3fc3_test_key_off_f0(ctx));
 
 	/* Brightness Setting (s6e3fc3_a32.c:1176-1177, force=1). */
@@ -568,8 +750,9 @@ static int s6e3fc3_get_modes(struct drm_panel *panel,
 
 	/* Expose the dfps pair (display_lcd_a32_common.dtsi:120-125).
 	 * 60Hz is preferred to match the probe FPS_60 default (s6e3fc3_a32.c:1409);
-	 * the 0x60 FPS DCS is fixed at that default -- selecting the 90Hz mode
-	 * does NOT reprogram it yet (TODO-BLOCKED on a per-mode update hook). */
+	 * the 0x60 FPS DCS follows the selected mode via s6e3fc3_switch_fps():
+	 * prepare() (panel_init -> brightness path) and every backlight update
+	 * re-program it from the stored fps_90 level. */
 	mode90 = drm_mode_duplicate(connector->dev, &s6e3fc3_mode_90hz);
 	if (!mode90)
 		return -ENOMEM;
@@ -613,7 +796,12 @@ static int s6e3fc3_probe(struct mipi_dsi_device *dsi)
 	mipi_dsi_set_drvdata(dsi, ctx);
 
 	ctx->dev = dev;
-	/* Probe FPS_60 default (s6e3fc3_a32.c:1409); see fps_90 comment. */
+	/* Real revision default (s6e3fc3_a32.c:1394): live-measured ID 0x800004
+	 * is rev 4, so rev>=3 tables + SYNC path until a DCS ID read proves
+	 * otherwise (reads are TODO-BLOCKED, see panel_init).
+	 * Probe FPS_60 default (s6e3fc3_a32.c:1409); re-derived through the
+	 * mode-switch mapping below once the backlight device exists. */
+	ctx->panel_rev = S6E3FC3_PANEL_REV_DEFAULT;
 	ctx->fps_90 = false;
 
 	/* Downstream: DSI CMD mode, 4 lanes, 24-bit packed
@@ -653,6 +841,13 @@ static int s6e3fc3_probe(struct mipi_dsi_device *dsi)
 	ctx->bl_dev->props.max_brightness = S6E3FC3_EXTEND_BRIGHTNESS;
 	ctx->bl_dev->props.brightness = S6E3FC3_DEFAULT_BRIGHTNESS;
 	ctx->bl_dev->props.power = BACKLIGHT_POWER_OFF;
+
+	/* Establish the FPS_60 probe default (s6e3fc3_a32.c:1409) through the
+	 * same vrefresh mapping every later mode-switch uses; the panel is
+	 * still off, so only the level is recorded (see s6e3fc3_switch_fps). */
+	ret = s6e3fc3_switch_fps(ctx, 60);
+	if (ret < 0)
+		return ret;
 
 	ctx->panel.prepare_prev_first = true;
 
