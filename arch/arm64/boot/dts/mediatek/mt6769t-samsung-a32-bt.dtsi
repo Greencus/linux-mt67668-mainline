@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * mt6769t-samsung-a32-bt.dtsi -- A32 Bluetooth (Track B, BTIF) fragment.
+ *
+ * Wiring (gated): add one line to mt6769t-samsung-a32.dts once the
+ * hardware gates close (TODO-BTIF):
+ *
+ *     #include "mt6769t-samsung-a32-bt.dtsi"
+ *
+ * The board .dts is intentionally NOT modified by the Track B change;
+ * this fragment is inert until included.
+ *
+ * Transport truth: BTIF is the compile-time default (connac2/Makefile:28
+ * -DCHIP_IF_BTIF, selector btmtk_chip_if.h:25). The BTIF path needs NO
+ * UART node, so this fragment deliberately contains NO serdev / ttyMT
+ * instance. A ttyMT wiring would need exact downstream evidence
+ * (which UART instance + baud + conninfra power strings); none is in
+ * the tree, so none is invented here -- any future serdev addition
+ * must cite that evidence or be marked TODO (TODO-UART-LEG).
+ *
+ * Power: NO regulator names, voltages, or GPIO numbers are invented.
+ * vcc-supply / reset-gpios are left ABSENT; the driver treats both as
+ * optional and logs TODO-POWER when missing. Uncomment and fill them
+ * only from measured/vendor-derived values.
+ */
+
+/ {
+	bluetooth-a32 {
+		/* New A32-specific compatible for the btmtk-a32 platform
+		 * driver. NOT "mediatek,mt6631-bluetooth": no such upstream
+		 * binding exists and claiming one would be fabrication.
+		 * A future upstream mt6631 binding can subsume this node.
+		 */
+		compatible = "mediatek,mt6768-bt-a32";
+		/* HARDWARE-UNPROVEN gate: stays disabled until controller
+		 * discovery + firmware download + basic HCI up are proven
+		 * on A32 silicon. Flip to "okay" only then.
+		 */
+		status = "disabled";
+
+		/* Firmware consumed (short basenames, no mediatek/ prefix;
+		 * expected under /lib/firmware/ -- cf. btmtk-a32.h):
+		 *   soc1_0_ram_bt_1a_1_hdr.bin
+		 *   soc1_0_patch_mcu_1a_1_hdr.bin
+		 *   soc1_0_ram_mcu_1a_1_hdr.bin
+		 * Post-HCI replay (NOT a loader blob):
+		 *   BT_FW.cfg  (autobt script, TODO-AUTOBT)
+		 */
+
+		/* TODO-POWER: fill ONLY from measured/vendor-derived data:
+		 *   vcc-supply = <&...>;
+		 *   reset-gpios = <&pio ... GPIO_ACTIVE_LOW>;
+		 */
+	};
+};

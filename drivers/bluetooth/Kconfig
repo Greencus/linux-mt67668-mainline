@@ -499,6 +499,24 @@ config BT_NXPUART
 	  Say Y here to compile support for NXP Bluetooth UART device into
 	  the kernel, or say M here to compile as a module (btnxpuart).
 
+config BT_MTKA32
+	tristate "MediaTek MT6768/A32 BTIF HCI driver (Track B)"
+	depends on BT
+	select FW_LOADER
+	help
+	  HCI driver for the Samsung Galaxy A32 MT6768/MT6631-class
+	  CONNSYS Bluetooth controller over the BTIF/STP transport.
+
+	  This is the Track B mainline bring-up driver (btmtk-a32):
+	  standard BlueZ hciX interface, WMT-over-HCI vendor commands,
+	  request_firmware() with the soc1_0_* A32 firmware set. The
+	  BTIF backend is an offline stub until hardware gates close;
+	  see docs/BLUETOOTH-MAINLINE-IMPLEMENTATION.md.
+
+	  Say M here to compile as module (btmtk-a32). Controller
+	  discovery and firmware download on real silicon are
+	  HARDWARE-UNPROVEN.
+
 config BT_INTEL_PCIE
 	tristate "Intel HCI PCIe driver"
 	depends on PCI
