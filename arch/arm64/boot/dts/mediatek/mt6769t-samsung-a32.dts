@@ -211,6 +211,105 @@
 	remote-endpoint = <&a32_panel_in>; /* SoC-common */
 };
 
+/* Connsys board power/clock/EMI path (W4-connsys). Scope: THIS block only.
+ * Every value tagged: vendor-derived = downstream mt6768 DTB reverse
+ * (build/downstream/out/.../mt6768.dtb.reverse.dts, read-only evidence);
+ * SoC-common = already in mt6768.dtsi/mt6358.dtsi; inferred = mainline
+ * integration with the exact consumer cited (no invented IDs).
+ * Deliberately OMITTED (see BLOCKED list in docs/CONNINFRA-GATE.md §5):
+ * clocks/clock-names (driver consumer compiled out on 6.18:
+ * COMMON_KERNEL_CLK_SUPPORT=1, mt6768.h:27-29; downstream "conn" was
+ * scpsys cell 1 with no mainline clock-cell provider — bus clocks ride
+ * the CONN genpd instead); resets (no evidenced mt6768 CCIF reset ID on
+ * mainline; downstream mt6768 has no store_reset_control — only mt6853
+ * has one, wrong silicon); pinctrl/ant-swap GPIO (A32 pins unknown). */
+&{/reserved-memory} {
+	consys_reserve: consys-reserve-memory {
+		compatible = "mediatek,consys-reserve-memory"; /* vendor-derived: DTB:370 */
+		no-map; /* vendor-derived: DTB:371 */
+		size = <0x0 0x440000>; /* vendor-derived: DTB:372 */
+		alignment = <0x0 0x1000000>; /* vendor-derived: DTB:373 */
+		alloc-ranges = <0x0 0x40000000 0x0 0x80000000>; /* vendor-derived: DTB:374; inside measured 4GB memory@40000000 */
+	};
+
+	wifi_reserve: wifi-reserve-memory {
+		compatible = "shared-dma-pool"; /* vendor-derived: DTB:378 */
+		no-map; /* vendor-derived: DTB:379 */
+		size = <0x0 0x300000>; /* vendor-derived: DTB:380 */
+		alignment = <0x0 0x1000000>; /* vendor-derived: DTB:381 */
+		alloc-ranges = <0x0 0x40000000 0x0 0x80000000>; /* vendor-derived: DTB:382 */
+	};
+};
+
+&{/soc} {
+	consys: consys@18002000 {
+		compatible = "mediatek,mt6768-consys"; /* vendor-derived: DTB:2925; bound by apwmt_of_ids (mtk_wcn_consys_hw.c) */
+		#address-cells = <2>; /* vendor-derived: DTB:2926 */
+		#size-cells = <2>; /* vendor-derived: DTB:2927 */
+		/* vendor-derived: DTB:2928, order = CONSYS_BASE_ADDRESS_INDEX
+		 * (mtk_wcn_consys_hw.h:172-181), consumed by
+		 * consys_read_reg_from_dts (of_iomap per index). */
+		reg = <0x0 0x18002000 0x0 0x1000>, /* MCU_BASE_INDEX */
+		      <0x0 0x10007000 0x0 0x100>, /* TOP_RGU_BASE_INDEX */
+		      <0x0 0x10001000 0x0 0x1000>, /* INFRACFG_AO_BASE_INDEX */
+		      <0x0 0x10006000 0x0 0x1000>, /* SPM_BASE_INDEX */
+		      <0x0 0x18007000 0x0 0x1000>, /* MCU_CONN_HIF_ON_BASE_INDEX */
+		      <0x0 0x180b1000 0x0 0x1000>, /* MCU_TOP_MISC_OFF_BASE_INDEX */
+		      <0x0 0x180a3000 0x0 0x1000>, /* MCU_CFG_ON_BASE_INDEX */
+		      <0x0 0x180a5000 0x0 0x800>, /* MCU_CIRQ_BASE_INDEX */
+		      <0x0 0x180c1000 0x0 0x1000>, /* MCU_TOP_MISC_ON_BASE_INDEX */
+		      <0x0 0x18004000 0x0 0x1000>; /* MCU_CONN_HIF_PDMA_BASE_INDEX */
+		/* vendor-derived: DTB:2929 (GIC_SPI=0; 0x8=LEVEL_LOW, 0x1=EDGE_RISING).
+		 * Index 0 = BGF eint, index 2 = conn2ap_sw_irq (dedicated log). */
+		interrupts = <GIC_SPI 284 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 78 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_SPI 287 IRQ_TYPE_EDGE_RISING>;
+		/* SoC-common providers, board-level binding: CONN genpd drives
+		 * pm_runtime_get_sync(&connsys_pdev->dev) (mt6768.c:715;
+		 * COMMON_KERNEL_CLK_SUPPORT=1 path). */
+		power-domains = <&spm MT6768_POWER_DOMAIN_CONN>; /* SoC-common */
+		/* Consumer names vendor-derived (mt6768.c:589-598) → mainline
+		 * providers (mt6358.dtsi). Mainline has ONE vcn33 rail, so
+		 * both split consumers share it (inferred, shared-regulator
+		 * legal; voltages 1.8/2.8/3.3V match DTB:1348/1378/1510). */
+		vcn18-supply = <&mt6358_vcn18_reg>; /* vendor-derived */
+		vcn28-supply = <&mt6358_vcn28_reg>; /* vendor-derived */
+		vcn33_bt-supply = <&mt6358_vcn33_reg>; /* inferred: shared single VCN33 */
+		vcn33_wifi-supply = <&mt6358_vcn33_reg>; /* inferred: shared single VCN33 */
+		/* Inferred integration: mtk_wcn_get_regmap() parses the "pmic"
+		 * phandle (mtk_wcn_consys_hw.c:258); mainline mt6397-core sets
+		 * drvdata to the chip (mt6397-core.c:391), so this resolves. */
+		pmic = <&pmic>; /* inferred */
+		/* Inferred integration: wmt_allocate_connsys_emi() parses
+		 * "memory-region" (mtk_wcn_consys_hw.c:290); pool = consys
+		 * 0x440000 reserve (FW patch/log/coredump EMI). */
+		memory-region = <&consys_reserve>; /* inferred */
+		status = "okay"; /* board-specific */
+	};
+
+	wifi: wifi@18000000 {
+		compatible = "mediatek,wifi"; /* vendor-derived: DTB:3741 */
+		reg = <0x0 0x18000000 0x0 0x100000>; /* vendor-derived: DTB:3742 */
+		interrupts = <GIC_SPI 285 IRQ_TYPE_LEVEL_LOW>; /* vendor-derived: DTB:3743 (0x11d=285, 0x8) */
+		memory-region = <&wifi_reserve>; /* vendor-derived: DTB:3744 (phandle 0x61 = wifi-reserve-memory) */
+		status = "okay"; /* board-specific */
+	};
+};
+
+/* PMIC regmap anchor for the connsys power path. The wmt driver registers
+ * consys_pmic_mt6358_dev_drv matching "mediatek,mt6358-consys"
+ * (mt6768.c:334-348) to fetch the mt6397 regmap for the OP_EN/HW-mode
+ * writes. INERT on mainline until the MFD cell table gains this compatible
+ * (drivers/mfd/mt6397-core.c, out of scope) — see BLOCKED item B5. The
+ * regulator_enable/disable half of every vcn path works WITHOUT the
+ * regmap (loud "failed to get regmap" + real regulator call). */
+&pmic {
+	a32_connsys_pmic: mt6358-consys {
+		compatible = "mediatek,mt6358-consys"; /* vendor-derived: mt6768.c:335 */
+		status = "okay"; /* board-specific */
+	};
+};
+
 /* OMITTED (no A32 evidence — each a TODO, none copied from Redmi):
  * gpio-leds/flashlight (pio152/153 Redmi-specific) TODO-LEDS;
  * i2c0 KTD3137 backlight (Redmi addr/tuning) TODO-BL;
