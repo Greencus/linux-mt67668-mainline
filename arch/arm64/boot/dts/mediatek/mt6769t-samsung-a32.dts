@@ -17,7 +17,7 @@
 #include "mt6358.dtsi" /* MT6358 companion PMIC, measured on this unit */ /* measured */
 #include "mt6769t-samsung-a32-ccci.dtsi" /* Track A: modem-ccci DISABLED until TODO-CCCI-PROBE */ /* board-specific */
 #include "mt6769t-samsung-a32-bt.dtsi" /* Track B: bluetooth-a32 DISABLED until BTIF gates close */ /* board-specific */
-#include "mt6769t-samsung-a32-usb.dtsi" /* Track C: mt6768-musb glue override, usb2 ENABLED (otg) */ /* board-specific */
+#include "mt6769t-samsung-a32-usb.dtsi" /* USB: generic mediatek musb, usb2 ENABLED (otg) */ /* board-specific */
 #include "mt6769t-samsung-a32-panel.dtsi" /* Track D: s6e3fc3 panel wiring, dsi0 ENABLED (see below) */ /* board-specific */
 
 &{/} {

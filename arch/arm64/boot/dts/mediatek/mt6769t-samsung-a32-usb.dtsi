@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * MT6768 MUSB/UDC A32 evidence fragment (Track C).
+ * A32 USB enablement fragment (upstream-generic MUSB path).
+ *
+ * The MUSB core/UDC binds via the UPSTREAM generic MediaTek MUSB driver
+ * (drivers/usb/musb/mediatek.c, compatible "mediatek,mtk-musb" fallback);
+ * no dedicated MT6768 glue driver is required. This fragment only enables
+ * the SoC usb2/t-phy nodes on the board with the OTG + software
+ * role-switch policy. The PHY is driven by generic-tphy-v1 (V1 pdata);
+ * no new PHY driver is needed.
  *
  * Include from the A32 board DTS once wired:
  *   #include "mt6769t-samsung-a32-usb.dtsi"
@@ -17,15 +24,14 @@
  * Deliberate OMISSIONS (do NOT "complete" without A32 evidence):
  * - No TCPC / typec connector node: Redmi willsemi,wusb3801 path is
  *   explicitly excluded; A32 TCPC is unknown (TODO-USB-ROLE stays open).
- * - No vbus-supply / VBUS GPIO / regulator: none evidenced for A32; the
- *   glue intentionally provides no set_vbus override (see mt6768.c).
+ * - No vbus-supply / VBUS GPIO / regulator: none evidenced for A32; no
+ *   set_vbus override exists upstream (board power must be measured
+ *   before any wiring is added).
  * - No dr_mode hard-coding to host/peripheral: measured policy is OTG
  *   with configfs gadget (sys.usb.controller=musb-hdrc); role defaults
  *   to software control.
  * - No HS tuning / tune@ tables: downstream phy_tuning values are NOT
  *   copied; generic-tphy-v1 owns the PHY.
- * - No pericfg/reset DT property: the musb binding forbids extra props;
- *   the glue resolves "mediatek,mt6768-pericfg" via syscon at runtime.
  */
 
 #include <dt-bindings/interrupt-controller/arm-gic.h>
