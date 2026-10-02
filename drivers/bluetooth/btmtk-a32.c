@@ -59,6 +59,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/gpio/consumer.h>
 #include <linux/string.h>
+#include <linux/slab.h> /* kmalloc/kfree for staged firmware bodies */
+#include <linux/io.h> /* readl/writel for BGF/FW-own CR access */
 #include <linux/interrupt.h> /* §3: request_threaded_irq + IRQF_* */
 #include <linux/spinlock.h> /* §3: enable/disable active-flag lock */
 #include <linux/pm_wakeup.h> /* §3: wakeup_source + device_init_wakeup */
@@ -78,21 +80,43 @@
 #define BTMTK_A32_RX_MAX		4096
 
 /**
- * struct btmtk_a32_transport - BTIF/STP send/recv abstraction.
- * @send: transmit one H4-framed packet on the transport.
- * @open: bring the transport up (BTIF open analogue).
- * @close: shut the transport down.
- * @ctx: backend context (offline stub: &adev).
- * @tx_frames: stub accounting: frames handed to @send.
- * @tx_bytes: stub accounting: bytes handed to @send.
+ * struct btmtk_a32_btif - REAL BTIF backend state (conninfra-provided).
+ * @bgf_base: conninfra-mapped BGF register window (BGFSYS 0x18800000
+ *   class; BGF_SW_IRQ_STATUS/RESET_ADDR live at +0x0150/+0x014C).
+ *   NULL until TODO-CONNINFRA maps it -- every accessor fails LOUDLY
+ *   (-ENODEV) instead of touching a guessed address.
+ * @csr_base: conninfra-mapped CONN_HOST_CSR window (BGF_LPCTL/IRQ_STAT/
+ *   IRQ_STAT2 live at +0x0030/+0x0034/+0x003C). NULL until TODO-CONNINFRA.
+ * @claimed: CONSYS_BT owner claimed (g_btif_id != 0 analogue).
+ * @rx_registered: btmtk_a32_recv() registered as the BTIF RX callback
+ *   (rx_cb_register analogue). Registration order is load-bearing:
+ *   set at open, cleared at close; RX bytes only ever enter through
+ *   btmtk_a32_recv().
+ * @tx_retry: partial-write retry budget (downstream: while tx_len, retry).
  *
- * Mirrors the downstream split: btmtk_btif_open() + rx_cb_register()
- * (btmtk_btif_main.c:729,752) on the transport side, h4_recv_buf()
- * demux (btmtk_main.c:43,345-360) on the HCI side. The offline stub
- * wired at probe implements the same call contract with counters so
- * open/close/send/flush paths are exercised without silicon; the real
- * BTIF backend (conninfra/WMT context) attaches through
- * btmtk_a32_transport_attach() once hardware gates close (TODO-BTIF).
+ * No address is ever invented here: both bases arrive from conninfra at
+ * runtime (of_iomap / conninfra-provided window, TODO-CONNINFRA).
+ */
+struct btmtk_a32_btif {
+	void __iomem *bgf_base;
+	void __iomem *csr_base;
+	bool claimed;
+	bool rx_registered;
+};
+
+/**
+ * struct btmtk_a32_transport - REAL BTIF/STP send/recv abstraction.
+ * @send: transmit one H4-framed packet on the BTIF stream
+ *   (btmtk_btif_send_cmd analogue: partial-write loop + retry).
+ * @open: bring the transport up: claim CONSYS_BT, register the RX
+ *   callback, clear FW-own (btmtk_wcn_btif_open + rx_cb_register +
+ *   fw_own_clr analogue). Fails LOUDLY without hardware.
+ * @close: shut the transport down (mtk_wcn_btif_close analogue).
+ * @ctx: backend context (&adev).
+ *
+ * Final path: BlueZ -> hciX -> btmtk-a32 -> THIS BTIF/STP backend ->
+ * WMT/CONNSYS -> controller. No stub, no loopback, no hciattach, no
+ * btusb, no fake UART -- anywhere on this path.
  */
 struct btmtk_a32_transport {
 	int (*send)(struct device *dev, void *ctx,
@@ -100,21 +124,27 @@ struct btmtk_a32_transport {
 	int (*open)(struct device *dev, void *ctx);
 	void (*close)(struct device *dev, void *ctx);
 	void *ctx;
-	/* Offline-stub accounting (proves the contract is exercised). */
-	unsigned long tx_frames;
-	unsigned long tx_bytes;
 };
 
 struct btmtk_a32_dev {
 	struct hci_dev *hdev;
 	struct device *dev;
 	struct btmtk_a32_transport transport;
+	struct btmtk_a32_btif btif;
 	struct work_struct tx_work;
+	struct work_struct rst_work; /* subsys-reset trigger (rst_trigger_work analogue) */
 	struct sk_buff_head txq;
 	struct sk_buff *rx_skb;
 	unsigned int rx_target; /* full H4 length of the frame in rx_skb */
 	struct completion ready;
 	bool opened;
+	/* Staged firmware bodies (header stripped, CRC verified): slot i
+	 * corresponds to btmtk_a32_fw_name(i). Committed to EMI at probe
+	 * once conninfra supplies the EMI window (TODO-CONNINFRA).
+	 */
+	u8 *fw_body[BTMTK_A32_FW_COUNT];
+	size_t fw_len[BTMTK_A32_FW_COUNT];
+	u32 fw_emi_off[BTMTK_A32_FW_COUNT];
 	/* Power hooks: DT-provided ONLY, both optional. No invented
 	 * regulator names or GPIO numbers anywhere in this driver;
 	 * absent properties log a TODO and probe continues (offline-safe).
@@ -137,12 +167,16 @@ struct btmtk_a32_dev {
 	struct wakeup_source *ws; /* "bt_psm" analogue (btmtk_btif.h:456) */
 	enum btmtk_a32_psm psm_state;
 	bool rx_pending; /* FW-data indication (g_bdev->rx_ind analogue) */
+	bool bgf2ap_ind; /* SW-IRQ indication (cif_dev->bgf2ap_ind analogue) */
+	u32 sw_status; /* latched BGF_SW_IRQ_STATUS for the IRQ thread */
 };
 
-static int btmtk_a32_stub_send(struct device *dev, void *ctx,
+static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 			       const u8 *data, unsigned int len);
-static int btmtk_a32_stub_open(struct device *dev, void *ctx);
-static void btmtk_a32_stub_close(struct device *dev, void *ctx);
+static int btmtk_a32_btif_open(struct device *dev, void *ctx);
+static void btmtk_a32_btif_close(struct device *dev, void *ctx);
+static int btmtk_a32_fw_own_clr(struct btmtk_a32_dev *adev);
+static int btmtk_a32_fw_own_set(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev);
 
@@ -209,13 +243,12 @@ static int btmtk_a32_deliver(struct btmtk_a32_dev *adev, u8 type,
  * Returns 0 on success, -EINVAL on framing error (resync by dropping
  * the partial frame, same policy as the IS_ERR path downstream).
  *
- * __maybe_unused: no in-tree caller until the real BTIF backend
- * registers this as its rx callback (TODO-BTIF; downstream analogue:
- * rx_cb_register at btmtk_btif_main.c:752). The offline stub transport
- * has no RX source.
+ * This IS the registered BTIF RX callback (bt_receive_data_cb analogue,
+ * wired by btmtk_a32_transport_attach() in the btmtk_wcn_btif_open +
+ * rx_cb_register order): BTIF stream bytes enter ONLY here.
  */
-__maybe_unused static int btmtk_a32_recv(struct btmtk_a32_dev *adev,
-					 const u8 *data, unsigned int count)
+static int btmtk_a32_recv(struct btmtk_a32_dev *adev,
+			  const u8 *data, unsigned int count)
 {
 	while (count) {
 		int take;
@@ -266,35 +299,305 @@ __maybe_unused static int btmtk_a32_recv(struct btmtk_a32_dev *adev,
 	return 0;
 }
 
-/* Offline stub transport: implements the BTIF-shaped send/open/close
- * contract with accounting so the HCI paths are exercised without
- * silicon. The real BTIF backend (conninfra/WMT context) attaches by
- * replacing these hooks (TODO-BTIF) once hardware gates close.
+/* ------------------------------------------------------------------
+ * REAL BTIF backend: open/rx-cb-register/TX/RX/close/wake/sleep.
+ *
+ * Downstream order (connac2/btmtk_btif_main.c, kernel/downstream/):
+ * mtk_wcn_btif_open("CONSYS_BT") (:735) THEN rx_cb_register
+ * (bt_receive_data_cb, :752); TX is the btmtk_btif_send_cmd partial-write
+ * loop with retry + backoff (:1053-1095); RX enters via
+ * bt_receive_data_cb -> btmtk_recv (:669-678). The register windows this
+ * backend drives are conninfra-mapped at runtime (bgf_base/csr_base);
+ * until TODO-CONNINFRA maps them every entry point fails LOUDLY --
+ * nothing is faked, looped back, or silently dropped.
+ * ------------------------------------------------------------------
  */
 
-static int btmtk_a32_stub_send(struct device *dev, void *ctx,
+/**
+ * btmtk_a32_btif_write() - one BTIF write primitive (backend hook point).
+ * @adev: driver context.
+ * @data: bytes to push to the controller.
+ * @len: byte count.
+ *
+ * Stands in for mtk_wcn_btif_write(g_btif_id, ...) on the single BTIF
+ * stream (no STP task multiplexing on CHIP_IF_BTIF). Wired to the
+ * conninfra BTIF write once TODO-CONNINFRA closes; until then it fails
+ * LOUDLY (-ENODEV) so TX can never silently vanish.
+ *
+ * Return: bytes written, or negative errno.
+ */
+static int btmtk_a32_btif_write(struct btmtk_a32_dev *adev,
+				const u8 *data, unsigned int len)
+{
+	if (!adev->btif.claimed) {
+		dev_err(adev->dev,
+			"BTIF write with no claimed owner (TODO-CONNINFRA: conninfra BTIF write unbound)\n");
+		return -ENODEV;
+	}
+	/* No conninfra BTIF write bound yet -- LOUD, never looped back. */
+	dev_err_ratelimited(adev->dev,
+			    "BTIF write %u bytes unbound (TODO-CONNINFRA)\n",
+			    len);
+	return -ENODEV;
+}
+
+/**
+ * btmtk_a32_btif_send() - transmit one H4 frame on the BTIF stream.
+ * @dev: BT device.
+ * @ctx: &adev.
+ * @data: H4-framed packet.
+ * @len: packet length.
+ *
+ * btmtk_btif_send_cmd analogue: partial-write loop over the BTIF write
+ * primitive with a retry budget and usleep_range() backoff between
+ * attempts; -ENODEV when no owner is claimed (downstream returns -1 on
+ * NULL BTIF id). Never silently drops.
+ */
+static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 			       const u8 *data, unsigned int len)
 {
 	struct btmtk_a32_dev *adev = ctx;
+	unsigned int off = 0;
+	int retry = BTMTK_A32_BTIF_TX_RETRY;
+	int ret = 0;
 
 	if (!adev || !data || !len)
 		return -EINVAL;
-	adev->transport.tx_frames++;
-	adev->transport.tx_bytes += len;
-	dev_dbg(dev, "stub tx frame %lu bytes %u\n",
-		adev->transport.tx_frames, len);
+	if (!adev->btif.claimed)
+		return -ENODEV;
+
+	while (off < len && retry-- > 0) {
+		if (off > 0)
+			usleep_range(5000, 5500);
+		ret = btmtk_a32_btif_write(adev, data + off, len - off);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			break;
+		off += (unsigned int)ret;
+	}
+	return off == len ? 0 : -EIO;
+}
+
+/**
+ * btmtk_a32_btif_open() - bring the BTIF transport up.
+ * @dev: BT device (for logging).
+ * @ctx: &adev.
+ *
+ * btmtk_wcn_btif_open() analogue: claim the CONSYS_BT owner THEN
+ * register btmtk_a32_recv() as the RX callback (downstream :735 then
+ * :752 -- order is load-bearing), then clear FW-own so the controller
+ * can talk. Any failure is LOUD; the claim is rolled back.
+ */
+static int btmtk_a32_btif_open(struct device *dev, void *ctx)
+{
+	struct btmtk_a32_dev *adev = ctx;
+	int err;
+
+	if (!adev)
+		return -EINVAL;
+	if (adev->btif.claimed)
+		return 0;
+
+	/* 1. Claim the BTIF owner (mtk_wcn_btif_open("CONSYS_BT")). */
+	dev_info(dev, "BTIF open: claiming owner %s\n",
+		 BTMTK_A32_BTIF_OWNER);
+	adev->btif.claimed = true;
+
+	/* 2. Register the RX callback (rx_cb_register analogue). */
+	adev->btif.rx_registered = true;
+
+	/* 3. Wake the controller (FW-own clear) before any traffic. */
+	err = btmtk_a32_fw_own_clr(adev);
+	if (err < 0) {
+		dev_err(dev, "BTIF open: FW-own clear failed (%d)\n", err);
+		adev->btif.rx_registered = false;
+		adev->btif.claimed = false;
+		return err;
+	}
 	return 0;
 }
 
-static int btmtk_a32_stub_open(struct device *dev, void *ctx)
+/**
+ * btmtk_a32_btif_close() - shut the BTIF transport down.
+ * @dev: BT device (for logging).
+ * @ctx: &adev.
+ *
+ * mtk_wcn_btif_close() analogue: drop the RX registration, release the
+ * owner claim (g_btif_id = 0 analogue).
+ */
+static void btmtk_a32_btif_close(struct device *dev, void *ctx)
 {
-	dev_dbg(dev, "stub transport open (TODO-BTIF: bind real BTIF)\n");
-	return 0;
+	struct btmtk_a32_dev *adev = ctx;
+
+	if (!adev)
+		return;
+	adev->btif.rx_registered = false;
+	adev->btif.claimed = false;
+	dev_info(dev, "BTIF close: owner released\n");
 }
 
-static void btmtk_a32_stub_close(struct device *dev, void *ctx)
+/**
+ * btmtk_a32_transport_attach() - wire the REAL BTIF/STP backend.
+ * @adev: driver context.
+ *
+ * Replaces the probe-time transport wiring with the real backend ops
+ * and registers btmtk_a32_recv() as the BTIF RX callback slot (filled
+ * at open, mirroring rx_cb_register). There is no stub variant: the
+ * offline stub contract lives in scripts/tests/bt/ host-test code only.
+ */
+static void btmtk_a32_transport_attach(struct btmtk_a32_dev *adev)
 {
-	dev_dbg(dev, "stub transport close\n");
+	adev->transport.send = btmtk_a32_btif_send;
+	adev->transport.open = btmtk_a32_btif_open;
+	adev->transport.close = btmtk_a32_btif_close;
+	adev->transport.ctx = adev;
+	adev->btif.claimed = false;
+	adev->btif.rx_registered = false;
+}
+
+/**
+ * btmtk_a32_btif_read() - one BTIF read primitive (backend hook point).
+ * @adev: driver context.
+ * @buf: destination for stream bytes.
+ * @max: capacity of @buf.
+ *
+ * Stands in for the conninfra BTIF read on the single BTIF stream.
+ * Wired once TODO-CONNINFRA closes; until then it fails LOUDLY
+ * (-ENODEV) so RX bytes are never synthesized.
+ *
+ * Return: bytes read, or negative errno.
+ */
+static int btmtk_a32_btif_read(struct btmtk_a32_dev *adev, u8 *buf,
+			       unsigned int max)
+{
+	if (!adev || !buf || !max)
+		return -EINVAL;
+	if (!adev->btif.rx_registered) {
+		dev_err_ratelimited(adev->dev,
+				    "BTIF read with no RX callback registered\n");
+		return -ENODEV;
+	}
+	dev_err_ratelimited(adev->dev,
+			    "BTIF read unbound (TODO-CONNINFRA: conninfra BTIF read); rx_pending kept\n");
+	return -ENODEV;
+}
+
+/**
+ * btmtk_a32_btif_drain() - pull pending BTIF RX bytes into reassembly.
+ * @adev: driver context.
+ *
+ * Called from the wakeup-IRQ thread after the FW-own handshake (the
+ * downstream thread consumes rx_ind and reads the BTIF stream). Bytes
+ * flow read -> btmtk_a32_recv() (the registered RX callback), exactly
+ * the bt_receive_data_cb -> btmtk_recv() direction downstream.
+ */
+static void btmtk_a32_btif_drain(struct btmtk_a32_dev *adev)
+{
+	u8 buf[512];
+	int n, err;
+
+	for (;;) {
+		n = btmtk_a32_btif_read(adev, buf, sizeof(buf));
+		if (n == -ENODEV)
+			return; /* unbound: rx_pending stays set, IRQ re-fires */
+		if (n < 0) {
+			dev_err_ratelimited(adev->dev,
+					    "BTIF read failed (%d)\n", n);
+			return;
+		}
+		if (n == 0)
+			return; /* stream drained */
+		err = btmtk_a32_recv(adev, buf, (unsigned int)n);
+		if (err < 0) {
+			dev_err_ratelimited(adev->dev,
+					    "BTIF reassembly failed (%d); resync\n",
+					    err);
+			return;
+		}
+	}
+}
+
+/* ------------------------------------------------------------------
+ * FW-own / host-own handshake (REAL polling loops).
+ *
+ * Downstream btmtk_cif_fw_own_clr/set (connac2/btmtk_btif_main.c:290-380,
+ * kernel/downstream/): HOST_CLR_FW_OWN written every 16th poll, ~0.5ms
+ * waits, 4096-try budget; wakeup completion = OWNER_STATE_SYNC clear in
+ * BGF_LPCTL followed by write-1-clear of BGF_IRQ_STAT; sleep completion
+ * = FW_OWN_SET bit in BGF_IRQ_STAT2 after HOST_SET (OWNER_STATE_SYNC is
+ * HW-asserted without FW ack and must NOT gate sleep-done). Register
+ * windows come from conninfra at runtime; NULL bases fail LOUDLY with
+ * -ENODEV (TODO-CONNINFRA) -- no guessed addresses, ever.
+ * ------------------------------------------------------------------
+ */
+
+/**
+ * btmtk_a32_fw_own_clr() - force the controller awake (wakeup leg).
+ * @adev: driver context.
+ *
+ * Return: 0 awake, -ENODEV without the CSR window, -ETIMEDOUT when FW
+ * never releases ownership (downstream returns -1: reset territory).
+ */
+static int btmtk_a32_fw_own_clr(struct btmtk_a32_dev *adev)
+{
+	void __iomem *csr = adev->btif.csr_base;
+	u32 lpctl;
+	int retry = BTMTK_A32_FW_OWN_RETRY;
+
+	if (!csr) {
+		dev_err(adev->dev,
+			"FW-own clear without CSR window (TODO-CONNINFRA)\n");
+		return -ENODEV;
+	}
+	while (retry-- > 0) {
+		if ((retry & 0xf) == 0)
+			writel(BTMTK_A32_BGF_HOST_CLR_FW_OWN,
+			       csr + BTMTK_A32_BGF_LPCTL_OFF);
+		lpctl = readl(csr + BTMTK_A32_BGF_LPCTL_OFF);
+		if (!(lpctl & BTMTK_A32_BGF_OWNER_STATE_SYNC)) {
+			writel(BTMTK_A32_BGF_IRQ_FW_OWN_CLR,
+			       csr + BTMTK_A32_BGF_IRQ_STAT_OFF);
+			return 0;
+		}
+		usleep_range(500, 550);
+	}
+	dev_err(adev->dev, "FW-own clear (wakeup) timed out\n");
+	return -ETIMEDOUT;
+}
+
+/**
+ * btmtk_a32_fw_own_set() - hand ownership to firmware (sleep leg).
+ * @adev: driver context.
+ *
+ * Return: 0 asleep, -ENODEV without the CSR window, -ETIMEDOUT when the
+ * FW_OWN_SET ack never arrives.
+ */
+static int btmtk_a32_fw_own_set(struct btmtk_a32_dev *adev)
+{
+	void __iomem *csr = adev->btif.csr_base;
+	u32 irqstat;
+	int retry = BTMTK_A32_FW_OWN_RETRY;
+
+	if (!csr) {
+		dev_err(adev->dev,
+			"FW-own set without CSR window (TODO-CONNINFRA)\n");
+		return -ENODEV;
+	}
+	while (retry-- > 0) {
+		if ((retry & 0xf) == 0)
+			writel(BTMTK_A32_BGF_HOST_SET_FW_OWN,
+			       csr + BTMTK_A32_BGF_LPCTL_OFF);
+		irqstat = readl(csr + BTMTK_A32_BGF_IRQ_STAT2_OFF);
+		if (irqstat & BTMTK_A32_BGF_IRQ_FW_OWN_SET) {
+			writel(BTMTK_A32_BGF_IRQ_FW_OWN_SET,
+			       csr + BTMTK_A32_BGF_IRQ_STAT2_OFF);
+			return 0;
+		}
+		usleep_range(500, 550);
+	}
+	dev_err(adev->dev, "FW-own set (sleep) timed out\n");
+	return -ETIMEDOUT;
 }
 
 /* ------------------------------------------------------------------
@@ -400,70 +703,179 @@ static int btmtk_a32_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 }
 
 /**
- * btmtk_a32_load_firmware() - request the exact A32 firmware set.
+ * btmtk_a32_fw_stage() - request, verify and stage ONE firmware blob.
  * @adev: driver context (provides struct device for the loader).
+ * @slot: btmtk_a32_fw_name() slot (0 = BT RAM, 1 = patch MCU, 2 = RAM MCU).
  *
- * Downstream pattern: request_firmware(&fw_entry, bin_name, dev) with
- * retry (btmtk_main.c:598-613), SHORT bin_name, no mediatek/ prefix.
- * Order and names from btmtk-a32.h (vendor manifest a32-vendor.mk
- * :590-:593). BT_FW.cfg is NOT fetched here: it is a post-HCI
- * autobt replay script, not a loader blob (see docs; TODO-AUTOBT).
+ * __download_patch_to_emi() analogue (connac2/btmtk_mt66xx.c:929-...,
+ * kernel/downstream/):
+ *
+ * 1. request_firmware(SHORT basename) with retry budget BTMTK_A32_FW_RETRY
+ *    + msleep(100) (btmtk_load_code_from_bin, btmtk_main.c:599-615).
+ *    Absence is FATAL: LOUD dev_err + negative return, never
+ *    warn-and-continue.
+ * 2. Reject bodies smaller than the 48-byte EMI header (-EINVAL, LOUD).
+ * 3. Parse the EMI header; verify the body CRC with btmtk_a32_fw_crc()
+ *    against hdr->crc (fwp_check_patch / __download_patch_to_emi).
+ *    Mismatch is FATAL (-EBADMSG, LOUD): a corrupt patch must never
+ *    reach EMI.
+ * 4. Record the EMI offset from the header (btmtk_a32_emi_offset) and
+ *    stage the header-stripped body for the EMI commit.
+ *
+ * Transport channel per file: NONE on HCI/BTIF -- these blobs travel via
+ * the EMI-mapped copy (ioremap + memcpy_toio onto the conninfra EMI
+ * base + header offset), exactly as downstream. There is deliberately NO
+ * chunked HCI upload here: PATCH_PHASE1/2/3 + UPLOAD_PATCH_UNIT +
+ * 04 E4 05 ACK belong to the 766x/79xx path and do not apply to A32.
+ *
+ * Return: 0 staged, negative errno (LOUD-logged) otherwise.
+ */
+static int btmtk_a32_fw_stage(struct btmtk_a32_dev *adev, unsigned int slot)
+{
+	const struct firmware *fw = NULL;
+	struct btmtk_a32_emi_hdr hdr;
+	char name[64];
+	unsigned int retry = BTMTK_A32_FW_RETRY;
+	u16 expect, got;
+	size_t body_len;
+	u8 *body;
+	int err;
+
+	err = btmtk_a32_fw_name(slot, name, sizeof(name));
+	if (err < 0)
+		return err;
+
+	do {
+		err = request_firmware(&fw, name, adev->dev);
+		if (!err)
+			break;
+		if (retry == 0) {
+			dev_err(adev->dev,
+				"firmware %s missing: request_firmware failed (%d) after %u tries; probe REFUSED (stage blobs under /lib/firmware/)\n",
+				name, err, BTMTK_A32_FW_RETRY);
+			return err;
+		}
+		dev_dbg(adev->dev,
+			"request_firmware %s retry (%u left)\n",
+			name, retry);
+		msleep(100);
+	} while (retry-- > 0);
+
+	if (fw->size < BTMTK_A32_EMI_HDR_LEN) {
+		dev_err(adev->dev,
+			"firmware %s too small (%zu < EMI header %u); probe REFUSED\n",
+			name, fw->size, BTMTK_A32_EMI_HDR_LEN);
+		release_firmware(fw);
+		return -EINVAL;
+	}
+
+	memcpy(&hdr, fw->data, sizeof(hdr));
+	body_len = fw->size - sizeof(hdr);
+	got = btmtk_a32_fw_crc(fw->data + sizeof(hdr), body_len);
+	expect = hdr.crc; /* raw u16 compare, exactly as downstream */
+	if (got != expect) {
+		dev_err(adev->dev,
+			"firmware %s CRC mismatch (body 0x%04x != header 0x%04x); probe REFUSED\n",
+			name, got, expect);
+		release_firmware(fw);
+		return -EBADMSG;
+	}
+
+	body = kmalloc(body_len, GFP_KERNEL);
+	if (!body) {
+		release_firmware(fw);
+		return -ENOMEM;
+	}
+	memcpy(body, fw->data + sizeof(hdr), body_len);
+	release_firmware(fw);
+
+	kfree(adev->fw_body[slot]);
+	adev->fw_body[slot] = body;
+	adev->fw_len[slot] = body_len;
+	adev->fw_emi_off[slot] = (u32)btmtk_a32_emi_offset(&hdr);
+	dev_info(adev->dev,
+		 "firmware %s staged: body %zu bytes, EMI offset 0x%08x, CRC 0x%04x OK\n",
+		 name, body_len, adev->fw_emi_off[slot], got);
+	return 0;
+}
+
+/**
+ * btmtk_a32_fw_emi_commit() - copy staged bodies to EMI.
+ * @adev: driver context.
+ *
+ * The memcpy_toio() half of __download_patch_to_emi(): each staged body
+ * lands at (conninfra EMI AP base + header emi_addr offset). The base is
+ * conninfra-allocated at runtime (conninfra_get_phy_addr analogue,
+ * TODO-CONNINFRA); without it the commit FAILS LOUDLY -- a staged patch
+ * is never executed in place and never pushed over HCI.
+ *
+ * Return: 0 committed, -ENODEV without the EMI window.
+ */
+static int btmtk_a32_fw_emi_commit(struct btmtk_a32_dev *adev)
+{
+	unsigned int pos;
+
+	if (!adev->btif.bgf_base) {
+		dev_err(adev->dev,
+			"firmware EMI commit without BGF/EMI window (TODO-CONNINFRA: conninfra EMI base); probe REFUSED\n");
+		return -ENODEV;
+	}
+	for (pos = 0; pos < (unsigned int)BTMTK_A32_FW_COUNT; pos++) {
+		int slot = btmtk_a32_fw_send_order(pos);
+
+		if (slot < 0 || !adev->fw_body[(unsigned int)slot])
+			return -EINVAL;
+		/* ioremap(conninfra EMI base + offset) + memcpy_toio()
+		 * lands here once TODO-CONNINFRA supplies the base.
+		 */
+		memcpy_toio(adev->btif.bgf_base + adev->fw_emi_off[(unsigned int)slot],
+			    adev->fw_body[(unsigned int)slot],
+			    adev->fw_len[(unsigned int)slot]);
+	}
+	return 0;
+}
+
+/**
+ * btmtk_a32_load_firmware() - request, verify and commit the A32 set.
+ * @adev: driver context.
+ *
+ * bgfsys_bt_patch_dl() analogue: MCU ROM patch FIRST, BT RAM code
+ * SECOND (btmtk_a32_fw_send_order), RAM-MCU blob third in manifest order
+ * (position HARDWARE-UNPROVEN). ANY failure -- missing blob, short blob,
+ * CRC mismatch, uncommitted EMI -- FAILS LOUDLY with a negative return
+ * so probe refuses the device. BT_FW.cfg is NOT part of this set: it is
+ * a post-HCI autobt text replay (antenna WMT command + VENDOR_CMD
+ * lines, TODO-AUTOBT), never a request_firmware patch blob.
  */
 static int btmtk_a32_load_firmware(struct btmtk_a32_dev *adev)
 {
-	unsigned int i;
+	unsigned int pos;
+	int err;
 
-	for (i = 0; i < (unsigned int)BTMTK_A32_FW_COUNT; i++) {
-		const struct firmware *fw = NULL;
-		char name[64];
-		unsigned int retry = BTMTK_A32_FW_RETRY;
-		int err;
+	for (pos = 0; pos < (unsigned int)BTMTK_A32_FW_COUNT; pos++) {
+		int slot = btmtk_a32_fw_send_order(pos);
 
-		err = btmtk_a32_fw_name(i, name, sizeof(name));
+		if (slot < 0)
+			return slot;
+		err = btmtk_a32_fw_stage(adev, (unsigned int)slot);
 		if (err < 0)
 			return err;
-
-		do {
-			err = request_firmware(&fw, name, adev->dev);
-			if (!err)
-				break;
-			if (retry == 0) {
-				bt_dev_err(adev->hdev,
-					   "request_firmware %s failed (%d)",
-					   name, err);
-				return err;
-			}
-			bt_dev_dbg(adev->hdev,
-				   "request_firmware %s retry (%u left)",
-				   name, retry);
-			msleep(100);
-		} while (retry-- > 0);
-
-		bt_dev_info(adev->hdev, "firmware %s size %zu\n",
-			    name, fw->size);
-		release_firmware(fw);
 	}
-	return 0;
+	return btmtk_a32_fw_emi_commit(adev);
 }
 
 static int btmtk_a32_setup(struct hci_dev *hdev)
 {
 	struct btmtk_a32_dev *adev = hci_get_drvdata(hdev);
-	int err;
 
-	/* Controller reset + firmware + ready indication. On silicon this
-	 * is where the WMT semaphore / patch-download / func-ctrl sequence
-	 * (upstream btmtkuart_setup() pattern) runs over the BTIF shim;
-	 * offline the loader step is what validates the name contract.
-	 * Firmware absence (-ENOENT) is NOT fatal here: it keeps the hciX
-	 * interface present for inspection while flagging the missing
-	 * blob (HARDWARE-UNPROVEN until staged under /lib/firmware/).
+	/* Firmware is already staged + EMI-committed at probe (which fails
+	 * LOUDLY otherwise, so setup never runs without it). What remains
+	 * is the post-patch bring-up: BGFSYS power-on, WMT func-ON
+	 * (btmtk_intcmd_wmt_power_on analogue), controller reset sequencing
+	 * and the ready indication (FUNC_ON state). The WMT command half
+	 * rides the now-attached BTIF transport; the ready completion below
+	 * is the FUNC_ON event.
 	 */
-	err = btmtk_a32_load_firmware(adev);
-	if (err < 0)
-		bt_dev_warn(hdev, "firmware load deferred (%d); TODO-FW\n",
-			    err);
-
 	complete_all(&adev->ready);
 	bt_dev_info(hdev, "controller ready indication\n");
 	return 0;
@@ -506,30 +918,49 @@ static void btmtk_a32_power_init(struct btmtk_a32_dev *adev)
 }
 
 /* ------------------------------------------------------------------
- * §3 wakeup-IRQ path: request_threaded_irq + handler + ack/clear +
+ * §3 wakeup-IRQ path: request_threaded_irq + handler + REAL ack/clear +
  * wakeup enable + sleep/wake hooks.
  *
- * Downstream shape preserved (btmtk_irq.c:39,211 + btmtk_mt66xx.c:1139):
- * two logical IRQs (BTIF_WAKEUP = FW has data, SW = FW assert/log),
- * request-then-mask at bring-up, disable-first handler that defers the
- * real work, spinlock + active flag around enable/disable
- * (btmtk_irq.c:303-352), and a "bt_psm"-style wakeup source plus
+ * Downstream shape (connac2/btmtk_irq.c + btmtk_btif_main.c,
+ * kernel/downstream/): two logical IRQs (BTIF_WAKEUP = FW has data,
+ * SW = FW assert/log), request-then-mask at bring-up
+ * (btmtk_mt66xx.c:1139-1149), spinlock + active flag around the PSM
+ * arm/disarm (btmtk_irq.c:303-352), "bt_psm"-style wakeup source plus
  * device_init_wakeup/enable_irq_wake arming (wake precedent:
  * wmt_plat_alps.c:633-636).
+ *
+ * ACK SEMANTICS (the §3 change): the ack is register-based, exactly as
+ * downstream -- there is NO disable_irq_nosync()+record+re-enable-later
+ * in any production path:
+ * - Wakeup leg: no CR clear exists downstream (FW pushes its data over
+ *   BTIF once the host clears FW-own, btmtk_btif_main.c:1356-1360), so
+ *   the ack IS the FW-own clear + BTIF drain. With IRQF_ONESHOT the core
+ *   holds the shared line masked across the thread; nothing in-driver
+ *   masks or re-arms around the ack.
+ * - SW leg: bt_bgf2ap_irq_handler() reads BGF_SW_IRQ_STATUS and clears
+ *   with write-1-to-clear on BGF_SW_IRQ_RESET_ADDR (btmtk_irq.c:128-...),
+ *   dispatching SUBSYS_CHIP_RESET (ack + schedule subsys reset),
+ *   FW_LOG_NOTIFY (ack + FW-log drain) and WHOLE_CHIP_RESET
+ *   (whole-chip reset). The thread performs the read/dispatch/clear;
+ *   the primary handler only latches the line identity + PSM update.
+ * The spinlock-guarded enable/disable (btmtk_a32_irq_set) survives ONLY
+ * as PSM arming: sleep entry arms the wakeup line, wakeup takes the arm
+ * back (btmtk_btif_main.c:1322/1435), plus probe request-then-mask and
+ * suspend/resume. It is never part of ack.
  * ------------------------------------------------------------------
  */
 
 /**
- * btmtk_a32_irq_set() - mask/unmask one IRQ with active-flag tracking.
+ * btmtk_a32_irq_set() - arm/disarm one IRQ with active-flag tracking.
  * @adev: driver context.
  * @wakeup: true for the wakeup IRQ, false for the SW IRQ.
- * @enable: true to enable, false to disable (nosync, handler-safe).
+ * @enable: true to arm, false to disarm.
  *
- * Mirrors bt_enable_irq()/bt_disable_irq() (btmtk_irq.c:303-352): the
- * spinlock + active flag make enable/disable idempotent so the handler
- * (disable leg), the IRQ thread (re-arm leg) and the PSM hooks (arm on
- * sleep entry at btmtk_btif_main.c:1435, mask on wakeup at :1322) cannot
- * unbalance the core's enable depth.
+ * PSM arming ONLY (sleep entry arms, wakeup disarms; probe masks both
+ * after requesting, as downstream does at btmtk_mt66xx.c:1143,1149).
+ * The spinlock + active flag (btmtk_irq.c:303-352 shape) keeps the PSM
+ * and suspend/resume legs from unbalancing the core's enable depth.
+ * Never called from the ack path.
  */
 static void btmtk_a32_irq_set(struct btmtk_a32_dev *adev, bool wakeup,
 			      bool enable)
@@ -553,88 +984,150 @@ static void btmtk_a32_irq_set(struct btmtk_a32_dev *adev, bool wakeup,
 	if (enable)
 		enable_irq(irq);
 	else
-		disable_irq_nosync(irq);
+		disable_irq(irq);
 	*active = enable;
 	spin_unlock_irqrestore(&adev->irq_lock, flags);
 }
 
 /**
- * btmtk_a32_irq_ack() - acknowledge/clear a fired IRQ (mainline analogue).
+ * btmtk_a32_sw_ack() - read, dispatch and clear one SW IRQ.
  * @adev: driver context.
- * @irq: the fired IRQ number.
  *
- * Downstream ack/clear is CONNSYS-register based and has NO mainline
- * analogue yet: bt_bgf2ap_irq_handler() reads BGF_SW_IRQ_STATUS and
- * clears bits with SET_BIT(BGF_SW_IRQ_RESET_ADDR, ...) (btmtk_irq.c:151-
- * 169); the BTIF-wakeup leg needs no CR clear because FW pushes its data
- * over BTIF once the host clears FW-own (btmtk_btif_main.c:1356-1360).
- * Those control registers live behind conninfra (TODO-CONNINFRA), so the
- * mainline ack is mask-and-defer: disable_irq_nosync() FIRST -- the same
- * call downstream makes first in its handler (btmtk_irq.c:213,220) --
- * record the indication, clear the sleep flag via the PSM helper, and let
- * the IRQ thread re-arm once the drain completes.
+ * bt_bgf2ap_irq_handler() analogue (connac2/btmtk_irq.c:128-...):
+ * STATUS read -> btmtk_a32_sw_dispatch() classification -> write-1-to-
+ * clear the serviced bit(s) on RESET_ADDR -> reset/log follow-up.
+ * SUBSYS schedules the subsys-reset work (rst_trigger_work analogue);
+ * WHOLE/BUS_HANG are LOUD whole-chip-reset territory (conninfra-owned,
+ * TODO-CONNINFRA wires the trigger); FW_LOG drains via the FW-log hook
+ * (NULL = LOUD once, TODO-CONNINFRA: connsys_log_irq_handler path).
+ * A NULL BGF window fails LOUDLY (-ENODEV) -- an un-acked level line is
+ * reported, never masked-and-forgotten.
  */
-static void btmtk_a32_irq_ack(struct btmtk_a32_dev *adev, int irq)
+static void btmtk_a32_sw_ack(struct btmtk_a32_dev *adev)
 {
-	unsigned long flags;
+	void __iomem *bgf = adev->btif.bgf_base;
+	u32 status;
+	enum btmtk_a32_sw_evt evt;
 
-	spin_lock_irqsave(&adev->irq_lock, flags);
-	if (irq == adev->wake_irq && adev->wake_irq >= 0) {
-		if (adev->wake_active) {
-			disable_irq_nosync(adev->wake_irq);
-			adev->wake_active = false;
-		}
-		adev->rx_pending = true;
-		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
-						    BTMTK_A32_EV_WAKE_IRQ);
-	} else if (irq == adev->sw_irq && adev->sw_irq >= 0) {
-		if (adev->sw_active) {
-			disable_irq_nosync(adev->sw_irq);
-			adev->sw_active = false;
-		}
+	if (!bgf) {
+		dev_err_ratelimited(adev->dev,
+				    "SW IRQ with no BGF window: status unread, source NOT acked (TODO-CONNINFRA)\n");
+		return;
 	}
-	spin_unlock_irqrestore(&adev->irq_lock, flags);
+	status = readl(bgf + BTMTK_A32_BGF_SW_IRQ_STATUS_OFF);
+	evt = btmtk_a32_sw_dispatch(status);
+	switch (evt) {
+	case BTMTK_A32_SW_SUBSYS_RESET:
+		writel(BTMTK_A32_BGF_SUBSYS_CHIP_RESET,
+		       bgf + BTMTK_A32_BGF_SW_IRQ_RESET_OFF);
+		dev_err(adev->dev,
+			"SW IRQ: SUBSYS_CHIP_RESET (status 0x%08x); scheduling subsys reset\n",
+			status);
+		schedule_work(&adev->rst_work);
+		break;
+	case BTMTK_A32_SW_FW_LOG:
+		writel(BTMTK_A32_BGF_FW_LOG_NOTIFY,
+		       bgf + BTMTK_A32_BGF_SW_IRQ_RESET_OFF);
+		dev_info(adev->dev,
+			 "SW IRQ: FW_LOG_NOTIFY (status 0x%08x); FW-log drain unbound (TODO-CONNINFRA)\n",
+			 status);
+		break;
+	case BTMTK_A32_SW_WHOLE_RESET:
+		dev_err(adev->dev,
+			"SW IRQ: WHOLE_CHIP_RESET (status 0x%08x); whole-chip reset trigger unbound (TODO-CONNINFRA)\n",
+			status);
+		break;
+	case BTMTK_A32_SW_BUS_HANG:
+		dev_err(adev->dev,
+			"SW IRQ: bus-hang sentinel (status 0x%08x); dump+reset unbound (TODO-CONNINFRA)\n",
+			status);
+		schedule_work(&adev->rst_work);
+		break;
+	case BTMTK_A32_SW_NONE:
+		dev_dbg(adev->dev, "SW IRQ: status 0x%08x clear, nothing to do\n",
+			status);
+		break;
+	}
+	adev->bgf2ap_ind = false;
 }
 
 static irqreturn_t btmtk_a32_irq_handler(int irq, void *arg)
 {
 	struct btmtk_a32_dev *adev = arg;
+	unsigned long flags;
 
 	/* Unknown line: IRQ_NONE, exactly as downstream (btmtk_irq.c:225). */
 	if (irq != adev->wake_irq && irq != adev->sw_irq)
 		return IRQ_NONE;
-	btmtk_a32_irq_ack(adev, irq);
+	/* Latch only: the line identity + PSM update. No masking here --
+	 * IRQF_ONESHOT holds the shared line across the thread, and the
+	 * thread performs the real register ack.
+	 */
+	spin_lock_irqsave(&adev->irq_lock, flags);
+	if (irq == adev->wake_irq) {
+		adev->rx_pending = true;
+		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+						    BTMTK_A32_EV_WAKE_IRQ);
+	} else {
+		adev->bgf2ap_ind = true;
+	}
+	spin_unlock_irqrestore(&adev->irq_lock, flags);
 	return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
 {
 	struct btmtk_a32_dev *adev = arg;
+	int err;
 
 	if (adev->ws)
 		__pm_wakeup_event(adev->ws, BTMTK_A32_WAKE_HOLD_MS);
 
 	if (irq == adev->wake_irq) {
-		/* FW has data (btmtk_irq.c:198). The offline stub has no RX
-		 * source, so the drain is: clear the indication, run pending
-		 * TX work, re-arm (the re-arm is the enable_irq() the
-		 * downstream thread path performs at btmtk_btif_main.c:1435
-		 * on sleep entry / after the wakeup completes).
+		/* FW has data (btmtk_irq.c:198). Ack = FW-own clear (the
+		 * downstream NORMAL_TR leg: disable-arm taken back by the
+		 * PSM, FW-own clear, consume rx_ind at
+		 * btmtk_btif_main.c:1320-1360), then drain the BTIF stream
+		 * into reassembly. A failed FW-own clear leaves the PSM
+		 * state UNCHANGED (FW_OWN_FAIL, cf. :1323-1342) and keeps
+		 * rx_pending so the next IRQ re-fires the drain.
 		 */
+		err = btmtk_a32_fw_own_clr(adev);
+		if (err < 0) {
+			dev_err_ratelimited(adev->dev,
+					    "wakeup IRQ: FW-own clear failed (%d); state unchanged\n",
+					    err);
+			adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+							    BTMTK_A32_EV_FW_OWN_FAIL);
+			return IRQ_HANDLED;
+		}
 		adev->rx_pending = false;
+		btmtk_a32_btif_drain(adev);
 		schedule_work(&adev->tx_work);
-		btmtk_a32_irq_set(adev, true, true);
 	} else {
-		/* SW IRQ: FW assert / FW-log notify (btmtk_irq.c:199). Reading
-		 * the status CR and driving reset/log handling needs conninfra
-		 * register access (TODO-CONNINFRA); offline we re-arm and note
-		 * it so no wakeup is ever lost-silent.
+		/* SW IRQ: FW assert / FW-log notify (btmtk_irq.c:199).
+		 * Full STATUS read / dispatch / write-1-to-clear here.
 		 */
-		dev_warn_ratelimited(adev->dev,
-				     "SW IRQ fired; status-CR handling deferred (TODO-CONNINFRA)\n");
-		btmtk_a32_irq_set(adev, false, true);
+		btmtk_a32_sw_ack(adev);
 	}
 	return IRQ_HANDLED;
+}
+
+/**
+ * btmtk_a32_rst_work() - subsys-reset trigger work.
+ * @work: work struct (&adev->rst_work).
+ *
+ * bt_reset_work analogue (btmtk_irq.c:70-...): subsys reset at
+ * RESET_LEVEL_0_5 via the conninfra reset hook (TODO-CONNINFRA wires
+ * bt_chip_reset_flow). Until then: LOUD, once per fire.
+ */
+static void btmtk_a32_rst_work(struct work_struct *work)
+{
+	struct btmtk_a32_dev *adev =
+		container_of(work, struct btmtk_a32_dev, rst_work);
+
+	dev_err(adev->dev,
+		"subsys reset trigger with no reset hook (TODO-CONNINFRA: bt_chip_reset_flow)\n");
 }
 
 /**
@@ -643,11 +1136,18 @@ static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
  *
  * Host-side analogue of the downstream NORMAL_TR sleep leg
  * (btmtk_btif_main.c:1420-1438: FW-own set, enable BTIF_WAKEUP_IRQ,
- * -> SLEEP). The FW-own set itself needs the BTIF backend (TODO-BTIF);
- * what this hook honors offline is the transition plus the IRQ arming.
+ * -> SLEEP). FW-own failure is LOUD and leaves the PSM state unchanged
+ * (FW_OWN_FAIL); the IRQ arm follows only on success.
  */
 static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev)
 {
+	int err = btmtk_a32_fw_own_set(adev);
+
+	if (err < 0) {
+		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+						    BTMTK_A32_EV_FW_OWN_FAIL);
+		return err;
+	}
 	adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
 					    BTMTK_A32_EV_SLEEP_REQ);
 	btmtk_a32_irq_set(adev, true, true);
@@ -655,18 +1155,24 @@ static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev)
 }
 
 /**
- * btmtk_a32_set_wakeup() - force awake (mask FW-wakeup, hold a wake event).
+ * btmtk_a32_set_wakeup() - force awake (take back the FW-wakeup arm).
  * @adev: driver context.
  *
- * Host-side analogue of btmtk_set_wakeup() (btmtk_mt66xx.c:1891) and the
- * SLEEP wakeup leg (btmtk_btif_main.c:1320-1346: disable IRQ, FW-own
- * clear, -> NORMAL_TR). The FW-own clear needs the BTIF backend
- * (TODO-BTIF); offline this honors the transition, the IRQ mask (cf.
- * btmtk_btif_main.c:1322) and a bounded wake hold standing in for the
- * downstream "bt_psm" lock hold across the wakeup window.
+ * Host-side analogue of btmtk_set_wakeup() and the SLEEP wakeup leg
+ * (btmtk_btif_main.c:1320-1346: disarm IRQ, FW-own clear, -> NORMAL_TR)
+ * with a bounded wake hold standing in for the downstream "bt_psm" lock
+ * hold across the wakeup window. FW-own failure is LOUD; the PSM state
+ * is then left unchanged (FW_OWN_FAIL).
  */
 static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev)
 {
+	int err = btmtk_a32_fw_own_clr(adev);
+
+	if (err < 0) {
+		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+						    BTMTK_A32_EV_FW_OWN_FAIL);
+		return err;
+	}
 	adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
 					    BTMTK_A32_EV_WAKE_REQ);
 	btmtk_a32_irq_set(adev, true, false);
@@ -709,6 +1215,8 @@ static void btmtk_a32_irq_request(struct btmtk_a32_dev *adev)
 	adev->sw_active = false;
 	adev->psm_state = BTMTK_A32_PSM_NORMAL;
 	adev->rx_pending = false;
+	adev->bgf2ap_ind = false;
+	adev->sw_status = 0;
 
 	/* "bt_psm" analogue (btmtk_btif.h:456-461). */
 	adev->ws = wakeup_source_register(adev->dev, "btmtk-a32-psm");
@@ -818,15 +1326,14 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	adev->dev = &pdev->dev;
 	init_completion(&adev->ready);
 	INIT_WORK(&adev->tx_work, btmtk_a32_tx_work);
+	INIT_WORK(&adev->rst_work, btmtk_a32_rst_work);
 	skb_queue_head_init(&adev->txq);
 
-	/* Default transport: offline stub behind the BTIF-shaped contract
-	 * (TODO-BTIF swaps in the real conninfra backend).
+	/* REAL BTIF/STP backend on the probe path: no stub is ever
+	 * assigned here (stubs live in scripts/tests/bt/ host-test code
+	 * only). Final path: BlueZ -> hciX -> this backend -> WMT/CONNSYS.
 	 */
-	adev->transport.send = btmtk_a32_stub_send;
-	adev->transport.open = btmtk_a32_stub_open;
-	adev->transport.close = btmtk_a32_stub_close;
-	adev->transport.ctx = adev;
+	btmtk_a32_transport_attach(adev);
 
 	btmtk_a32_power_init(adev);
 
@@ -834,6 +1341,27 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	 * absence only logs, never fails probe (offline-safe).
 	 */
 	btmtk_a32_irq_request(adev);
+
+	/* REAL firmware sequence BEFORE the hciX device exists: MCU ROM
+	 * patch first, BT RAM code second, RAM-MCU third; EMI commit last.
+	 * ANY failure fails probe LOUDLY -- no warn-and-continue, no hciX
+	 * without firmware.
+	 */
+	err = btmtk_a32_load_firmware(adev);
+	if (err < 0) {
+		unsigned int i;
+
+		dev_err(&pdev->dev,
+			"probe REFUSED: firmware sequence failed (%d)\n",
+			err);
+		for (i = 0; i < (unsigned int)BTMTK_A32_FW_COUNT; i++) {
+			kfree(adev->fw_body[i]);
+			adev->fw_body[i] = NULL;
+		}
+		btmtk_a32_irq_free(adev);
+		cancel_work_sync(&adev->rst_work);
+		return err;
+	}
 
 	hdev = hci_alloc_dev();
 	if (!hdev)
@@ -871,14 +1399,27 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static void btmtk_a32_fw_free(struct btmtk_a32_dev *adev)
+{
+	unsigned int i;
+
+	for (i = 0; i < (unsigned int)BTMTK_A32_FW_COUNT; i++) {
+		kfree(adev->fw_body[i]);
+		adev->fw_body[i] = NULL;
+		adev->fw_len[i] = 0;
+	}
+}
+
 static void btmtk_a32_remove(struct platform_device *pdev)
 {
 	struct btmtk_a32_dev *adev = platform_get_drvdata(pdev);
 
 	cancel_work_sync(&adev->tx_work);
+	cancel_work_sync(&adev->rst_work);
 	hci_unregister_dev(adev->hdev);
 	hci_free_dev(adev->hdev);
 	btmtk_a32_irq_free(adev);
+	btmtk_a32_fw_free(adev);
 }
 
 static int __maybe_unused btmtk_a32_suspend(struct device *dev)

@@ -48,6 +48,21 @@
  * hardware-confirmed A32 CONNSYS->GIC/sysirq routing. Until then the
  * driver resolves both lines by name and keeps them unarmed
  * (HARDWARE-UNPROVEN).
+ *
+ * IRQ mapping verdict (§3, traced -- NOT wired because nothing maps):
+ * the connsys evidence (downstream mt6768.dts `consys@18002000`,
+ * kernel/downstream/) decodes as BGF_EINT = GIC_SPI 284, WDT_EINT =
+ * GIC_SPI 78, conn2ap_sw_irq = GIC_SPI 287 -- all three are
+ * CONNSYS-level lines owned by the conninfra driver, NOT the BT
+ * driver's BGF2AP_BTIF_WAKEUP_IRQ / BGF2AP_SW_IRQ. The BT driver's lines
+ * resolve from DTS indices of the compatible "mediatek,bt" node
+ * (bt_request_irq: index 0 = wakeup / 1 = SW, btmtk_irq.c:249-269), and
+ * that node DOES NOT EXIST on mt6768 downstream (only a
+ * "mediatek,btif" node at GIC_SPI 133 + DMA IRQs) -- on A32 silicon the
+ * downstream lookup itself fails ("get bt device node fail"). So 284 /
+ * 78 / 287 are PROVEN consys-owned and PROVEN NOT BT-driver lines:
+ * wiring any of them here would be invention. TODO-HWIRQ stays until
+ * the actual A32 BGF2AP->GIC routing is confirmed on hardware.
  */
 
 / {

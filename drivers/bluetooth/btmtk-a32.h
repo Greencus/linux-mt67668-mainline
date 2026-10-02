@@ -124,6 +124,251 @@ typedef uint32_t u32;
 #define BTMTK_A32_FW_RETRY	10	/* mirror downstream retry budget */
 
 /* ------------------------------------------------------------------
+ * §3 REAL firmware-download contract (EMI, not HCI-chunked).
+ *
+ * Downstream 66xx/CONNAC2 path (the A32/MT6631-class path -- NOT the
+ * 766x/79xx USB/SDIO path) downloads firmware by copying patch bodies
+ * into EMI, never by HCI-chunked WMT upload:
+ *
+ * - Entry: bt_hw_and_mcu_on() -> btmtk_load_rom_patch() ->
+ *   is_mt66xx() -> btmtk_load_rom_patch_66xx() -> bgfsys_bt_patch_dl()
+ *   (connac2/btmtk_mt66xx.c:1115-1125, kernel/downstream/).
+ * - Order is FIXED: bgfsys_mcu_rom_patch_dl() FIRST (g_fwp_names[0],
+ *   the MCU ROM patch), then bgfsys_bt_ram_code_dl() (g_fwp_names[1],
+ *   the BT RAM code). Each leg is __download_patch_to_emi()
+ *   (btmtk_mt66xx.c:929-...): btmtk_load_code_from_bin() with retry 10
+ *   (btmtk_main.c:599-615: request_firmware + msleep(100)), reject when
+ *   smaller than the 48-byte EMI header, parse struct fw_patch_emi_hdr,
+ *   strip the header, copy the body to EMI (conninfra-supplied base +
+ *   header emi_addr offset via ioremap + memcpy_toio).
+ * - A32 name composition follows compose_fw_name()
+ *   (platform_base.h:220-249): "<BIN>[_<flavor>]_1_hdr.bin" with the
+ *   flavor char from the "mediatek,bt" flavor_bin DT property; A32's
+ *   manifest pins flavor 'a': soc1_0_patch_mcu_1a_1_hdr.bin (MCU slot,
+ *   sent FIRST) and soc1_0_ram_bt_1a_1_hdr.bin (BT slot, sent SECOND).
+ *   The manifest's third blob, soc1_0_ram_mcu_1a_1_hdr.bin, has NO
+ *   downstream 66xx send-order evidence (PATCH_FILE_NUM is 2); it is
+ *   staged THIRD in manifest order with its position marked
+ *   HARDWARE-UNPROVEN.
+ * - There is NO HCI chunk/phase/ACK loop on this path: PATCH_PHASE1/2/3,
+ *   UPLOAD_PATCH_UNIT (2048), PATCH_INFO_SIZE (30) and the 04 E4 05
+ *   LD_PATCH_EVT belong to the 766x/79xx btmtk_load_fw_patch_using_wmt_cmd
+ *   path (btmtk_main.c:1368-1440) and MUST NOT be replayed here.
+ * - BT_FW.cfg is NOT a patch blob: btmtk_intcmd_wmt_send_antenna_cmd()
+ *   (btmtk_mt66xx.c:1043-...) loads it as TEXT, finds the
+ *   "[driver_antenna][<chipid>]" tag and sends ONE WMT command
+ *   (01 6F FC ... 01 55 antenna-efem); the remaining VENDOR_CMD lines are
+ *   post-HCI autobt replay (TODO-AUTOBT). It is never checksummed or
+ *   EMI-copied; the driver only inventories the name.
+ *
+ * Pure (testable) part of that contract lives here; the request_firmware
+ * + EMI-copy half lives in btmtk-a32.c and fails probe LOUDLY when any
+ * blob is absent or fails verification.
+ * ------------------------------------------------------------------
+ */
+
+/* EMI patch header, byte-identical to downstream struct fw_patch_emi_hdr
+ * (connac2/btmtk_mt66xx.c:46-55, kernel/downstream/): 16+4+2+2+4+4+14+2
+ * = 48 bytes. Field ORDER is the contract (emi_addr middle bytes select
+ * the EMI offset; crc covers the body AFTER this header).
+ */
+#define BTMTK_A32_EMI_HDR_LEN	48
+#define BTMTK_A32_EMI_DT_LEN	16
+
+struct btmtk_a32_emi_hdr {
+	u8 date_time[BTMTK_A32_EMI_DT_LEN];
+	u8 plat[4];
+	u16 hw_ver;
+	u16 sw_ver;
+	u8 emi_addr[4];
+	u32 subsys_id;
+	u8 reserved[14];
+	u16 crc;
+};
+
+/* 48-byte EMI header layout guard (field order = downstream contract). */
+_Static_assert(sizeof(struct btmtk_a32_emi_hdr) == BTMTK_A32_EMI_HDR_LEN,
+	       "EMI header must be exactly 48 bytes");
+
+/**
+ * btmtk_a32_fw_send_order - download sequence position -> firmware slot.
+ * @pos: 0..BTMTK_A32_FW_COUNT-1 in on-the-wire send order.
+ *
+ * Downstream bgfsys_bt_patch_dl() sends the MCU ROM patch FIRST and the
+ * BT RAM code SECOND; the A32 manifest's third blob (RAM MCU) has no
+ * downstream order evidence and goes last (HARDWARE-UNPROVEN position).
+ * Slots are the btmtk_a32_fw_name() indices (0 = BT RAM, 1 = patch MCU,
+ * 2 = RAM MCU), kept stable so the name contract never shifts.
+ *
+ * Return: slot index, or -EINVAL on out-of-range @pos.
+ */
+static inline int btmtk_a32_fw_send_order(unsigned int pos)
+{
+	static const u8 order[BTMTK_A32_FW_COUNT] = { 1, 0, 2 };
+
+	if (pos >= (unsigned int)BTMTK_A32_FW_COUNT)
+		return -EINVAL;
+	return order[pos];
+}
+
+/**
+ * btmtk_a32_fw_crc - EMI patch body checksum (fwp_checksume16 algorithm).
+ * @data: body bytes (AFTER the 48-byte EMI header).
+ * @len: body length.
+ *
+ * Exact downstream fwp_checksume16 (connac2/btmtk_mt66xx.c:114-137):
+ * 16-bit ones'-complement sum over the body, trailing odd byte added
+ * raw, result bitwise-inverted. Compared against hdr->crc by
+ * fwp_check_patch (:166) / __download_patch_to_emi.
+ *
+ * Return: checksum to compare against the header crc field.
+ */
+static inline u16 btmtk_a32_fw_crc(const u8 *data, unsigned int len)
+{
+	u32 sum = 0;
+
+	if (!data)
+		return 0;
+	while (len > 1) {
+		sum += (u32)data[0] | ((u32)data[1] << 8);
+		data += 2;
+		if (sum & 0x80000000u)
+			sum = (sum & 0xffffu) + (sum >> 16);
+		len -= 2;
+	}
+	if (len)
+		sum += *data;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+	return (u16)~sum;
+}
+
+/**
+ * btmtk_a32_emi_offset - EMI offset selected by a patch header.
+ * @hdr: parsed 48-byte EMI header.
+ *
+ * Downstream __download_patch_to_emi: the header emi_addr is the FW view
+ * 0xFXXXXXXX; the middle two bytes are the offset added to the
+ * conninfra-supplied EMI AP physical base
+ * (emi_addr[2] << 16 | emi_addr[1] << 8).
+ *
+ * Return: offset, or -EINVAL on NULL @hdr.
+ */
+static inline int btmtk_a32_emi_offset(const struct btmtk_a32_emi_hdr *hdr)
+{
+	if (!hdr)
+		return -EINVAL;
+	return ((int)hdr->emi_addr[2] << 16) | ((int)hdr->emi_addr[1] << 8);
+}
+
+/* ------------------------------------------------------------------
+ * §3 BTIF transport + CONNSYS register contract (pure part).
+ *
+ * BTIF open/rx/TX/close shape (connac2/btmtk_btif_main.c,
+ * kernel/downstream/):
+ * - open: mtk_wcn_btif_open("CONSYS_BT", &id) (:735, owner string at :46)
+ *   THEN mtk_wcn_btif_rx_cb_register(id, bt_receive_data_cb) (:752) --
+ *   registration order is load-bearing (no RX source before open);
+ *   dpidle-idle workqueue arming is power policy, not transport.
+ * - RX: bt_receive_data_cb (:669-678) clears the PSM sleep_flag and calls
+ *   btmtk_recv() (h4_recv_buf demux) -- this driver's btmtk_a32_recv()
+ *   is that callback.
+ * - TX: btmtk_btif_send_cmd (:1053-1095) partial-write loop over
+ *   mtk_wcn_btif_write() with retry budget + usleep_range() backoff
+ *   between attempts; returns -1 when the BTIF id is NULL (never
+ *   silently drops).
+ * - close: mtk_wcn_btif_close(id) + id = 0 (:724-...).
+ * There is NO STP task/channel multiplexing on the BTIF path: the
+ * ENABLESTP/mtk_stp_split branch in btmtk_recv() is compiled out on
+ * CHIP_IF_BTIF (connac2/Makefile:28 -DCHIP_IF_BTIF); WMT-vs-BT channel
+ * selection is the 01 6F FC opcode match inside the single BTIF stream.
+ *
+ * CONNSYS register contract (connac2/btmtk_mt66xx_reg.h,
+ * kernel/downstream/ -- connac2-COMMON offsets/bits; the absolute bases
+ * BGF_REG_BASE_ADDR (BGFSYS 0x18800000 window) and CONN_HOST_CSR_TOP are
+ * conninfra-mapped at runtime and are NEVER hardcoded here):
+ * - BGF_SW_IRQ_STATUS = BGF_BASE + 0x0150, RESET_ADDR = BGF_BASE + 0x014C;
+ *   BGF_WHOLE_CHIP_RESET = BIT(26), BGF_SUBSYS_CHIP_RESET = BIT(25),
+ *   BGF_FW_LOG_NOTIFY = BIT(24) (:253-257).
+ * - FW-own handshake: BGF_LPCTL = CSR_BASE + 0x0030, HOST_SET_FW_OWN =
+ *   BIT(0), HOST_CLR_FW_OWN = BIT(1), OWNER_STATE_SYNC = BIT(2);
+ *   BGF_IRQ_STAT = CSR_BASE + 0x0034, FW_OWN_CLR = BIT(0);
+ *   BGF_IRQ_STAT2 = CSR_BASE + 0x003C, FW_OWN_SET = BIT(0) (:226-239).
+ * - Polling budget LPCR_POLLING_RTY_LMT = 4096 with ~0.5ms waits
+ *   (btmtk_btif_main.c:48, :290-330): wakeup polls OWNER_STATE_SYNC
+ *   clear after HOST_CLR then write-1-clears IRQ_STAT; sleep polls
+ *   IRQ_STAT2 FW_OWN_SET after HOST_SET (HW asserts OWNER_STATE_SYNC
+ *   without FW ack, so it must NOT be used as the sleep-done test).
+ * ------------------------------------------------------------------
+ */
+
+/* BGF software-IRQ status/clear offsets (relative to the conninfra-
+ * provided BGF register base) and dispatch bits. Values from
+ * connac2/btmtk_mt66xx_reg.h:253-257 (kernel/downstream/).
+ */
+#define BTMTK_A32_BGF_SW_IRQ_STATUS_OFF	0x0150
+#define BTMTK_A32_BGF_SW_IRQ_RESET_OFF	0x014C
+#define BTMTK_A32_BGF_WHOLE_CHIP_RESET	(1u << 26)
+#define BTMTK_A32_BGF_SUBSYS_CHIP_RESET	(1u << 25)
+#define BTMTK_A32_BGF_FW_LOG_NOTIFY	(1u << 24)
+
+/* FW-own/host-own handshake offsets (relative to the conninfra-provided
+ * CONN_HOST_CSR base) and bits (connac2/btmtk_mt66xx_reg.h:226-239).
+ */
+#define BTMTK_A32_BGF_LPCTL_OFF		0x0030
+#define BTMTK_A32_BGF_HOST_SET_FW_OWN	(1u << 0)
+#define BTMTK_A32_BGF_HOST_CLR_FW_OWN	(1u << 1)
+#define BTMTK_A32_BGF_OWNER_STATE_SYNC	(1u << 2)
+#define BTMTK_A32_BGF_IRQ_STAT_OFF	0x0034
+#define BTMTK_A32_BGF_IRQ_FW_OWN_CLR	(1u << 0)
+#define BTMTK_A32_BGF_IRQ_STAT2_OFF	0x003C
+#define BTMTK_A32_BGF_IRQ_FW_OWN_SET	(1u << 0)
+
+/* FW-own polling budget: 4096 x ~0.5ms (btmtk_btif_main.c:48). */
+#define BTMTK_A32_FW_OWN_RETRY		4096
+
+/* BTIF owner name claimed at open (btmtk_btif_main.c:46). */
+#define BTMTK_A32_BTIF_OWNER		"CONSYS_BT"
+
+/* BTIF TX partial-write retry budget (btmtk_btif_send_cmd shape). */
+#define BTMTK_A32_BTIF_TX_RETRY		5
+
+/* SW-IRQ dispatch outcome for the threaded handler (mirrors the
+ * bt_bgf2ap_irq_handler() branches, connac2/btmtk_irq.c:128-...).
+ */
+enum btmtk_a32_sw_evt {
+	BTMTK_A32_SW_NONE = 0,		/* status clear / nothing to do */
+	BTMTK_A32_SW_SUBSYS_RESET,	/* SUBSYS_CHIP_RESET: schedule reset */
+	BTMTK_A32_SW_FW_LOG,		/* FW_LOG_NOTIFY: drain FW log */
+	BTMTK_A32_SW_WHOLE_RESET,	/* WHOLE_CHIP_RESET: whole-chip reset */
+	BTMTK_A32_SW_BUS_HANG,		/* 0xDEADFEED / unreadable: dump+reset */
+};
+
+/**
+ * btmtk_a32_sw_dispatch - classify a BGF_SW_IRQ_STATUS value.
+ * @status: raw BGF_SW_IRQ_STATUS register value.
+ *
+ * Priority mirrors bt_bgf2ap_irq_handler(): SUBSYS first (ack + reset
+ * path), then FW_LOG, then WHOLE_CHIP, else none. 0xDEADFEED (bus
+ * timeout sentinel) maps to BUS_HANG.
+ *
+ * Return: the dispatch outcome.
+ */
+static inline enum btmtk_a32_sw_evt
+btmtk_a32_sw_dispatch(u32 status)
+{
+	if (status == 0xDEADFEEDu)
+		return BTMTK_A32_SW_BUS_HANG;
+	if (status & (u32)BTMTK_A32_BGF_SUBSYS_CHIP_RESET)
+		return BTMTK_A32_SW_SUBSYS_RESET;
+	if (status & (u32)BTMTK_A32_BGF_FW_LOG_NOTIFY)
+		return BTMTK_A32_SW_FW_LOG;
+	if (status & (u32)BTMTK_A32_BGF_WHOLE_CHIP_RESET)
+		return BTMTK_A32_SW_WHOLE_RESET;
+	return BTMTK_A32_SW_NONE;
+}
+
+/* ------------------------------------------------------------------
  * §3 wakeup-IRQ contract (pure part: indices, DT names, PSM states).
  *
  * Downstream resolves both IRQs from DT, never from drum-tight
