@@ -60,7 +60,9 @@
 #include <linux/gpio/consumer.h>
 #include <linux/string.h>
 #include <linux/slab.h> /* kmalloc/kfree for staged firmware bodies */
-#include <linux/io.h> /* readl/writel for BGF/FW-own CR access */
+#include <linux/io.h> /* readl/writel/readb/writeb for BTIF/BGF/CSR access */
+#include <linux/clk.h> /* BTIF + AP-DMA clocks (clk-mt6768 gates) */
+#include <linux/of_reserved_mem.h> /* EMI pool lookup for the FW commit */
 #include <linux/interrupt.h> /* §3: request_threaded_irq + IRQF_* */
 #include <linux/spinlock.h> /* §3: enable/disable active-flag lock */
 #include <linux/pm_wakeup.h> /* §3: wakeup_source + device_init_wakeup */
@@ -80,28 +82,43 @@
 #define BTMTK_A32_RX_MAX		4096
 
 /**
- * struct btmtk_a32_btif - REAL BTIF backend state (conninfra-provided).
- * @bgf_base: conninfra-mapped BGF register window (BGFSYS 0x18800000
- *   class; BGF_SW_IRQ_STATUS/RESET_ADDR live at +0x0150/+0x014C).
- *   NULL until TODO-CONNINFRA maps it -- every accessor fails LOUDLY
- *   (-ENODEV) instead of touching a guessed address.
- * @csr_base: conninfra-mapped CONN_HOST_CSR window (BGF_LPCTL/IRQ_STAT/
- *   IRQ_STAT2 live at +0x0030/+0x0034/+0x003C). NULL until TODO-CONNINFRA.
- * @claimed: CONSYS_BT owner claimed (g_btif_id != 0 analogue).
+ * struct btmtk_a32_btif - REAL BTIF backend state (§1 production paths).
+ * @base: BTIF PIO window (DT reg "btif", 0x1100c000/0x1000; THR/RBR/
+ *   IER/IIR/LSR/FIFOCTRL live here). Mapped at probe; never NULL after.
+ * @bgf_base: BGF register window (DT reg "bgf", 0x18800000/0x1000;
+ *   BGF_SW_IRQ_STATUS/RESET_ADDR live at +0x0150/+0x014C).
+ * @csr_base: CONN_HOST_CSR window (DT reg "csr", 0x18060000/0x1000;
+ *   BGF_LPCTL/IRQ_STAT/IRQ_STAT2 live at +0x0030/+0x0034/+0x003C).
+ * @clk_btif: "btifc" gate (mainline CLK_INFRA_BTIF). Prepared at probe,
+ *   enabled at open, disabled at close (hal_btif_clk pattern).
+ * @clk_apdma: "apdmac" gate (mainline CLK_INFRA_AP_DMA). Same handling.
+ * @btif_irq: BTIF-block IRQ (DT "btif", GIC_SPI 133 LEVEL_LOW).
+ *   Requested at open, freed at close; RX IER armed with it.
+ * @claimed: CONSYS_BT owner claimed (g_btif_id != 0 analogue;
+ *   double-open refused like E_BTIF_ALREADY_OPEN).
  * @rx_registered: btmtk_a32_recv() registered as the BTIF RX callback
  *   (rx_cb_register analogue). Registration order is load-bearing:
  *   set at open, cleared at close; RX bytes only ever enter through
  *   btmtk_a32_recv().
- * @tx_retry: partial-write retry budget (downstream: while tx_len, retry).
+ * @btif_irq_requested: BTIF IRQ currently requested (open/close balance).
+ * @tx_lock: serializes THR pushes (send path is the only PIO writer;
+ *   TXEEN stays off, so no IRQ top-up races it).
  *
- * No address is ever invented here: both bases arrive from conninfra at
- * runtime (of_iomap / conninfra-provided window, TODO-CONNINFRA).
+ * No address is invented: every window/IRQ/clock comes from the DT
+ * fragment (downstream-evidenced values), and probe REFUSES the device
+ * when any of them is absent.
  */
 struct btmtk_a32_btif {
+	void __iomem *base;
 	void __iomem *bgf_base;
 	void __iomem *csr_base;
+	struct clk *clk_btif;
+	struct clk *clk_apdma;
+	int btif_irq;
 	bool claimed;
 	bool rx_registered;
+	bool btif_irq_requested;
+	spinlock_t tx_lock;
 };
 
 /**
@@ -139,8 +156,8 @@ struct btmtk_a32_dev {
 	struct completion ready;
 	bool opened;
 	/* Staged firmware bodies (header stripped, CRC verified): slot i
-	 * corresponds to btmtk_a32_fw_name(i). Committed to EMI at probe
-	 * once conninfra supplies the EMI window (TODO-CONNINFRA).
+	 * corresponds to btmtk_a32_fw_name(i). Committed to the
+	 * memory-region EMI pool at probe (btmtk_a32_fw_emi_commit).
 	 */
 	u8 *fw_body[BTMTK_A32_FW_COUNT];
 	size_t fw_len[BTMTK_A32_FW_COUNT];
@@ -177,6 +194,7 @@ static int btmtk_a32_btif_open(struct device *dev, void *ctx);
 static void btmtk_a32_btif_close(struct device *dev, void *ctx);
 static int btmtk_a32_fw_own_clr(struct btmtk_a32_dev *adev);
 static int btmtk_a32_fw_own_set(struct btmtk_a32_dev *adev);
+static void btmtk_a32_fw_free(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev);
 
@@ -300,45 +318,100 @@ static int btmtk_a32_recv(struct btmtk_a32_dev *adev,
 }
 
 /* ------------------------------------------------------------------
- * REAL BTIF backend: open/rx-cb-register/TX/RX/close/wake/sleep.
+ * §1 REAL BTIF backend: PIO owner/open/TX/RX/close/wake/sleep.
  *
- * Downstream order (connac2/btmtk_btif_main.c, kernel/downstream/):
- * mtk_wcn_btif_open("CONSYS_BT") (:735) THEN rx_cb_register
- * (bt_receive_data_cb, :752); TX is the btmtk_btif_send_cmd partial-write
- * loop with retry + backoff (:1053-1095); RX enters via
- * bt_receive_data_cb -> btmtk_recv (:669-678). The register windows this
- * backend drives are conninfra-mapped at runtime (bgf_base/csr_base);
- * until TODO-CONNINFRA maps them every entry point fails LOUDLY --
- * nothing is faked, looped back, or silently dropped.
+ * Downstream shape (btif/common/ + connac2/btmtk_btif_main.c,
+ * kernel/downstream/): mtk_wcn_btif_open("CONSYS_BT") THEN
+ * rx_cb_register (bt_receive_data_cb); TX is the _btif_pio_write loop
+ * (LSR room -> writeb THR, retry budget 10) under the
+ * btmtk_btif_send_cmd outer retry; RX is IRQ-driven ONLY
+ * (mtk_wcn_btif_read() itself returns 0 -- no polled read exists):
+ * btif_irq_handler -> hal_btif_irq_handler IIR loop -> readb RBR ->
+ * rx_cb -> btmtk_recv. Open brings clocks + hw_init + PIO modes + IRQ;
+ * close drops rx_cb, frees the IRQ and releases clocks + claim.
+ * DMA (windows/IRQs/programming) is NOT here: TODO-DMA.
  * ------------------------------------------------------------------
  */
 
 /**
- * btmtk_a32_btif_write() - one BTIF write primitive (backend hook point).
+ * btmtk_a32_btif_hw_init() - BTIF PIO bring-up register sequence.
+ * @adev: driver context (clocks already enabled).
+ *
+ * hal_btif_hw_init() analogue (btif_plat.c): FAKELCR normal, handshake
+ * on, FIFOCLR RX then TX, TRI_LVL = TX(8)|RX(1)|LOOP_DIS (loopback off
+ * via the same TRI_LVL write), DMA TX+RX off (= PIO mode), AUTORST on,
+ * TXEEN off, RXFEN on. TXEEN stays off: TX is fully synchronous, so no
+ * TX_EMPTY top-up path exists to race it.
+ */
+static void btmtk_a32_btif_hw_init(struct btmtk_a32_dev *adev)
+{
+	void __iomem *base = adev->btif.base;
+	u32 fifo;
+
+	writel(0, base + BTMTK_A32_BTIF_FAKELCR_OFF);
+	writel(BTMTK_A32_BTIF_HANDSHAKE_ON,
+	       base + BTMTK_A32_BTIF_HANDSHAKE_OFF);
+
+	fifo = readl(base + BTMTK_A32_BTIF_FIFOCTRL_OFF);
+	fifo |= BTMTK_A32_BTIF_FIFOCTRL_CLR_RX;
+	writel(fifo, base + BTMTK_A32_BTIF_FIFOCTRL_OFF);
+	fifo &= ~BTMTK_A32_BTIF_FIFOCTRL_CLR_RX;
+	writel(fifo, base + BTMTK_A32_BTIF_FIFOCTRL_OFF);
+	fifo |= BTMTK_A32_BTIF_FIFOCTRL_CLR_TX;
+	writel(fifo, base + BTMTK_A32_BTIF_FIFOCTRL_OFF);
+	fifo &= ~BTMTK_A32_BTIF_FIFOCTRL_CLR_TX;
+	writel(fifo, base + BTMTK_A32_BTIF_FIFOCTRL_OFF);
+
+	writel(btmtk_a32_btif_tri_lvl(),
+	       base + BTMTK_A32_BTIF_TRI_LVL_OFF);
+
+	fifo = readl(base + BTMTK_A32_BTIF_DMA_EN_OFF);
+	fifo &= ~(BTMTK_A32_BTIF_DMA_EN_TX | BTMTK_A32_BTIF_DMA_EN_RX);
+	fifo |= BTMTK_A32_BTIF_DMA_EN_AUTORST;
+	writel(fifo, base + BTMTK_A32_BTIF_DMA_EN_OFF);
+
+	fifo = readl(base + BTMTK_A32_BTIF_IER_OFF);
+	fifo &= ~BTMTK_A32_BTIF_IER_TXEEN;
+	fifo |= BTMTK_A32_BTIF_IER_RXFEN;
+	writel(fifo, base + BTMTK_A32_BTIF_IER_OFF);
+}
+
+/**
+ * btmtk_a32_btif_pio_write() - push bytes to THR under the LSR rule.
  * @adev: driver context.
- * @data: bytes to push to the controller.
+ * @data: bytes to push.
  * @len: byte count.
  *
- * Stands in for mtk_wcn_btif_write(g_btif_id, ...) on the single BTIF
- * stream (no STP task multiplexing on CHIP_IF_BTIF). Wired to the
- * conninfra BTIF write once TODO-CONNINFRA closes; until then it fails
- * LOUDLY (-ENODEV) so TX can never silently vanish.
+ * _btif_pio_write() + hal_btif_send_data() analogue (legacy synchronous
+ * leg, no kfifo): LSR TEMT -> 16 room, THRE -> 8 room, else 0;
+ * writeb() to THR; retry budget BTMTK_A32_BTIF_PIO_TX_RETRY. The
+ * TXEEN IRQ stays off, so completion is observed here, not in an IRQ.
  *
- * Return: bytes written, or negative errno.
+ * Return: bytes pushed to the FIFO (short = FIFO full the whole budget).
  */
-static int btmtk_a32_btif_write(struct btmtk_a32_dev *adev,
-				const u8 *data, unsigned int len)
+static unsigned int btmtk_a32_btif_pio_write(struct btmtk_a32_dev *adev,
+					     const u8 *data, unsigned int len)
 {
-	if (!adev->btif.claimed) {
-		dev_err(adev->dev,
-			"BTIF write with no claimed owner (TODO-CONNINFRA: conninfra BTIF write unbound)\n");
-		return -ENODEV;
+	unsigned int sent = 0, retry = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&adev->btif.tx_lock, flags);
+	while (sent < len) {
+		unsigned int room, take;
+		u32 lsr = readl(adev->btif.base + BTMTK_A32_BTIF_LSR_OFF);
+
+		room = btmtk_a32_btif_tx_room(lsr);
+		take = room < len - sent ? room : len - sent;
+		while (take--)
+			writeb(data[sent++],
+			       adev->btif.base + BTMTK_A32_BTIF_THR_OFF);
+		if (sent >= len)
+			break;
+		if (++retry > BTMTK_A32_BTIF_PIO_TX_RETRY)
+			break;
 	}
-	/* No conninfra BTIF write bound yet -- LOUD, never looped back. */
-	dev_err_ratelimited(adev->dev,
-			    "BTIF write %u bytes unbound (TODO-CONNINFRA)\n",
-			    len);
-	return -ENODEV;
+	spin_unlock_irqrestore(&adev->btif.tx_lock, flags);
+	return sent;
 }
 
 /**
@@ -348,10 +421,11 @@ static int btmtk_a32_btif_write(struct btmtk_a32_dev *adev,
  * @data: H4-framed packet.
  * @len: packet length.
  *
- * btmtk_btif_send_cmd analogue: partial-write loop over the BTIF write
- * primitive with a retry budget and usleep_range() backoff between
- * attempts; -ENODEV when no owner is claimed (downstream returns -1 on
- * NULL BTIF id). Never silently drops.
+ * btmtk_btif_send_cmd analogue: partial-write loop over the PIO push
+ * with a retry budget and usleep_range() backoff between attempts;
+ * -ENODEV when no owner is claimed (downstream returns -1 on NULL BTIF
+ * id). Bytes reaching THR are on the wire to the controller -- never
+ * silently dropped, never looped back.
  */
 static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 			       const u8 *data, unsigned int len)
@@ -359,7 +433,6 @@ static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 	struct btmtk_a32_dev *adev = ctx;
 	unsigned int off = 0;
 	int retry = BTMTK_A32_BTIF_TX_RETRY;
-	int ret = 0;
 
 	if (!adev || !data || !len)
 		return -EINVAL;
@@ -367,16 +440,123 @@ static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 		return -ENODEV;
 
 	while (off < len && retry-- > 0) {
+		unsigned int n;
+
 		if (off > 0)
 			usleep_range(5000, 5500);
-		ret = btmtk_a32_btif_write(adev, data + off, len - off);
-		if (ret < 0)
-			return ret;
-		if (ret == 0)
+		n = btmtk_a32_btif_pio_write(adev, data + off, len - off);
+		off += n;
+		if (n == 0 && retry == 0)
 			break;
-		off += (unsigned int)ret;
 	}
-	return off == len ? 0 : -EIO;
+	if (off != len) {
+		dev_err(dev, "BTIF PIO TX short (%u/%u); controller or clocks stalled\n",
+			off, len);
+		return -EIO;
+	}
+	return 0;
+}
+
+/**
+ * btmtk_a32_connsys_power_on() - BGFSYS/MCU power gate (loud TODO).
+ * @adev: driver context.
+ *
+ * The bt_hw_and_mcu_on() BGFSYS power-on + MCU-start half runs on
+ * conninfra power: conninfra_pwr_on(CONNDRV_TYPE_BT) (downstream
+ * btmtk_set_power_on: conninfra_pwr_on BEFORE anything else). There is
+ * NO in-repo provider (kernel/wifi-6.18 exports no conninfra_pwr_on;
+ * no in-tree conninfra/connfem power driver), so this FAILS LOUDLY
+ * with the exact missing input instead of pretending power is on.
+ * BTIF clocks (ours, mainline-gated) are NOT a substitute and are
+ * handled separately.
+ *
+ * Missing input: in-tree conninfra power driver (or conninfra.ko)
+ * exporting conninfra_pwr_on(), bound to the consys DT node.
+ *
+ * Return: 0 powered (once a provider exists), -ENODEV without one.
+ */
+static int btmtk_a32_connsys_power_on(struct btmtk_a32_dev *adev)
+{
+	dev_err(adev->dev,
+		"CONNSYS power-on unbound: need conninfra_pwr_on(CONNDRV_TYPE_BT) provider (in-tree conninfra driver or conninfra.ko); BTIF clocks alone cannot start BGFSYS/MCU (TODO-CONNINFRA-PWR)\n");
+	return -ENODEV;
+}
+
+/**
+ * btmtk_a32_btif_irq_handler() - BTIF-block IRQ: IIR loop + RBR drain.
+ * @irq: fired line (must be the DT "btif" line).
+ * @arg: &adev.
+ *
+ * hal_btif_irq_handler() + btif_rx_irq_handler() analogue: read IIR;
+ * while RX|RX_TIMEOUT: readb() RBR into a chunk, feed btmtk_a32_recv()
+ * (the registered RX callback -- downstream rx_cb); TX_EMPTY needs no
+ * action (synchronous TX, TXEEN off). The IIR/RBR reads ARE the ack
+ * (16550 semantics): no disable/re-enable in this path (deliberate
+ * deviation from the downstream entry/exit mask -- same ack effect via
+ * source-clearing reads, no software mask window). IIR_NINT (nothing
+ * pending) on a shared line returns IRQ_NONE.
+ */
+static irqreturn_t btmtk_a32_btif_irq_handler(int irq, void *arg)
+{
+	struct btmtk_a32_dev *adev = arg;
+	void __iomem *base = adev->btif.base;
+	u32 iir;
+
+	if (irq != adev->btif.btif_irq || !base)
+		return IRQ_NONE;
+
+	iir = readl(base + BTMTK_A32_BTIF_IIR_OFF);
+	if (iir & BTMTK_A32_BTIF_IIR_NINT)
+		return IRQ_NONE;
+
+	while (iir & (BTMTK_A32_BTIF_IIR_RX |
+		      BTMTK_A32_BTIF_IIR_RX_TIMEOUT)) {
+		u8 chunk[256];
+		unsigned int n = 0;
+		int err;
+
+		while ((iir & (BTMTK_A32_BTIF_IIR_RX |
+				BTMTK_A32_BTIF_IIR_RX_TIMEOUT)) &&
+		       n < sizeof(chunk)) {
+			chunk[n++] = readb(base + BTMTK_A32_BTIF_RBR_OFF);
+			iir = readl(base + BTMTK_A32_BTIF_IIR_OFF);
+		}
+		adev->rx_pending = false;
+		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
+						    BTMTK_A32_EV_WAKE_IRQ);
+		err = btmtk_a32_recv(adev, chunk, n);
+		if (err < 0) {
+			dev_err_ratelimited(adev->dev,
+					    "BTIF RX reassembly failed (%d); resync\n",
+					    err);
+		}
+	}
+	if (adev->ws)
+		__pm_wakeup_event(adev->ws, BTMTK_A32_WAKE_HOLD_MS);
+	return IRQ_HANDLED;
+}
+
+/**
+ * btmtk_a32_btif_wake_pulse() - AP->CONNSYS wakeup pulse.
+ * @adev: driver context.
+ *
+ * hal_btif_raise_wak_sig() analogue: CLR WAK bit, sleep 128-160us
+ * (> 1/32k period + margin), SET WAK bit -- pulls ap_wakeup_consys low
+ * then high so the controller notices host traffic after sleep.
+ */
+static void btmtk_a32_btif_wake_pulse(struct btmtk_a32_dev *adev)
+{
+	void __iomem *base = adev->btif.base;
+	u32 wak;
+
+	if (!base)
+		return;
+	wak = readl(base + BTMTK_A32_BTIF_WAK_OFF);
+	wak &= ~BTMTK_A32_BTIF_WAK_BIT;
+	writel(wak, base + BTMTK_A32_BTIF_WAK_OFF);
+	usleep_range(128, 160);
+	wak |= BTMTK_A32_BTIF_WAK_BIT;
+	writel(wak, base + BTMTK_A32_BTIF_WAK_OFF);
 }
 
 /**
@@ -384,10 +564,13 @@ static int btmtk_a32_btif_send(struct device *dev, void *ctx,
  * @dev: BT device (for logging).
  * @ctx: &adev.
  *
- * btmtk_wcn_btif_open() analogue: claim the CONSYS_BT owner THEN
- * register btmtk_a32_recv() as the RX callback (downstream :735 then
- * :752 -- order is load-bearing), then clear FW-own so the controller
- * can talk. Any failure is LOUD; the claim is rolled back.
+ * mtk_wcn_btif_open("CONSYS_BT") + btif_open() + connac2
+ * btmtk_wcn_btif_open() analogue, in load-bearing order: single-owner
+ * claim (double-open refused, E_BTIF_ALREADY_OPEN analogue) -> clocks
+ * enable -> hw_init + PIO modes -> BTIF IRQ request (DT-resolved id +
+ * DT trigger, like _btif_set_default_setting) -> RX callback slot armed
+ * (rx_cb_register analogue) -> CONNSYS power gate -> FW-own clear.
+ * Any failure rolls back in reverse order, LOUDLY.
  */
 static int btmtk_a32_btif_open(struct device *dev, void *ctx)
 {
@@ -397,25 +580,63 @@ static int btmtk_a32_btif_open(struct device *dev, void *ctx)
 	if (!adev)
 		return -EINVAL;
 	if (adev->btif.claimed)
-		return 0;
+		return -EBUSY;
 
-	/* 1. Claim the BTIF owner (mtk_wcn_btif_open("CONSYS_BT")). */
 	dev_info(dev, "BTIF open: claiming owner %s\n",
 		 BTMTK_A32_BTIF_OWNER);
 	adev->btif.claimed = true;
 
-	/* 2. Register the RX callback (rx_cb_register analogue). */
+	err = clk_prepare_enable(adev->btif.clk_btif);
+	if (err < 0) {
+		dev_err(dev, "BTIF open: btifc enable failed (%d)\n", err);
+		goto err_claim;
+	}
+	err = clk_prepare_enable(adev->btif.clk_apdma);
+	if (err < 0) {
+		dev_err(dev, "BTIF open: apdmac enable failed (%d)\n", err);
+		goto err_btif_clk;
+	}
+
+	btmtk_a32_btif_hw_init(adev);
+
+	err = request_irq(adev->btif.btif_irq, btmtk_a32_btif_irq_handler,
+			  0, BTMTK_A32_BTIF_IRQ_NAME, adev);
+	if (err < 0) {
+		dev_err(dev, "BTIF open: IRQ %d request failed (%d)\n",
+			adev->btif.btif_irq, err);
+		goto err_apdma_clk;
+	}
+	adev->btif.btif_irq_requested = true;
+
+	/* RX callback slot armed (rx_cb_register analogue). */
 	adev->btif.rx_registered = true;
 
-	/* 3. Wake the controller (FW-own clear) before any traffic. */
+	/* BGFSYS/MCU power gate (loud TODO until a provider exists). */
+	err = btmtk_a32_connsys_power_on(adev);
+	if (err < 0)
+		goto err_irq;
+
+	/* Wake the controller (FW-own clear) before any traffic. */
 	err = btmtk_a32_fw_own_clr(adev);
 	if (err < 0) {
 		dev_err(dev, "BTIF open: FW-own clear failed (%d)\n", err);
-		adev->btif.rx_registered = false;
-		adev->btif.claimed = false;
-		return err;
+		goto err_irq;
 	}
 	return 0;
+
+err_irq:
+	adev->btif.rx_registered = false;
+	if (adev->btif.btif_irq_requested) {
+		free_irq(adev->btif.btif_irq, adev);
+		adev->btif.btif_irq_requested = false;
+	}
+err_apdma_clk:
+	clk_disable_unprepare(adev->btif.clk_apdma);
+err_btif_clk:
+	clk_disable_unprepare(adev->btif.clk_btif);
+err_claim:
+	adev->btif.claimed = false;
+	return err;
 }
 
 /**
@@ -423,16 +644,31 @@ static int btmtk_a32_btif_open(struct device *dev, void *ctx)
  * @dev: BT device (for logging).
  * @ctx: &adev.
  *
- * mtk_wcn_btif_close() analogue: drop the RX registration, release the
- * owner claim (g_btif_id = 0 analogue).
+ * mtk_wcn_btif_close() + btif_close() analogue: drop the RX callback
+ * (rx_cb = NULL analogue), mask RX IER, free the BTIF IRQ, disable both
+ * clocks, release the owner claim (g_btif_id = 0 analogue).
  */
 static void btmtk_a32_btif_close(struct device *dev, void *ctx)
 {
 	struct btmtk_a32_dev *adev = ctx;
+	void __iomem *base;
+	u32 ier;
 
-	if (!adev)
+	if (!adev || !adev->btif.claimed)
 		return;
+	base = adev->btif.base;
 	adev->btif.rx_registered = false;
+	if (base) {
+		ier = readl(base + BTMTK_A32_BTIF_IER_OFF);
+		ier &= ~BTMTK_A32_BTIF_IER_RXFEN;
+		writel(ier, base + BTMTK_A32_BTIF_IER_OFF);
+	}
+	if (adev->btif.btif_irq_requested) {
+		free_irq(adev->btif.btif_irq, adev);
+		adev->btif.btif_irq_requested = false;
+	}
+	clk_disable_unprepare(adev->btif.clk_apdma);
+	clk_disable_unprepare(adev->btif.clk_btif);
 	adev->btif.claimed = false;
 	dev_info(dev, "BTIF close: owner released\n");
 }
@@ -441,10 +677,9 @@ static void btmtk_a32_btif_close(struct device *dev, void *ctx)
  * btmtk_a32_transport_attach() - wire the REAL BTIF/STP backend.
  * @adev: driver context.
  *
- * Replaces the probe-time transport wiring with the real backend ops
- * and registers btmtk_a32_recv() as the BTIF RX callback slot (filled
- * at open, mirroring rx_cb_register). There is no stub variant: the
- * offline stub contract lives in scripts/tests/bt/ host-test code only.
+ * Probe-time wiring of the real backend ops. There is no stub variant:
+ * the offline stub contract lives in scripts/tests/bt/ host-test code
+ * only.
  */
 static void btmtk_a32_transport_attach(struct btmtk_a32_dev *adev)
 {
@@ -454,68 +689,8 @@ static void btmtk_a32_transport_attach(struct btmtk_a32_dev *adev)
 	adev->transport.ctx = adev;
 	adev->btif.claimed = false;
 	adev->btif.rx_registered = false;
-}
-
-/**
- * btmtk_a32_btif_read() - one BTIF read primitive (backend hook point).
- * @adev: driver context.
- * @buf: destination for stream bytes.
- * @max: capacity of @buf.
- *
- * Stands in for the conninfra BTIF read on the single BTIF stream.
- * Wired once TODO-CONNINFRA closes; until then it fails LOUDLY
- * (-ENODEV) so RX bytes are never synthesized.
- *
- * Return: bytes read, or negative errno.
- */
-static int btmtk_a32_btif_read(struct btmtk_a32_dev *adev, u8 *buf,
-			       unsigned int max)
-{
-	if (!adev || !buf || !max)
-		return -EINVAL;
-	if (!adev->btif.rx_registered) {
-		dev_err_ratelimited(adev->dev,
-				    "BTIF read with no RX callback registered\n");
-		return -ENODEV;
-	}
-	dev_err_ratelimited(adev->dev,
-			    "BTIF read unbound (TODO-CONNINFRA: conninfra BTIF read); rx_pending kept\n");
-	return -ENODEV;
-}
-
-/**
- * btmtk_a32_btif_drain() - pull pending BTIF RX bytes into reassembly.
- * @adev: driver context.
- *
- * Called from the wakeup-IRQ thread after the FW-own handshake (the
- * downstream thread consumes rx_ind and reads the BTIF stream). Bytes
- * flow read -> btmtk_a32_recv() (the registered RX callback), exactly
- * the bt_receive_data_cb -> btmtk_recv() direction downstream.
- */
-static void btmtk_a32_btif_drain(struct btmtk_a32_dev *adev)
-{
-	u8 buf[512];
-	int n, err;
-
-	for (;;) {
-		n = btmtk_a32_btif_read(adev, buf, sizeof(buf));
-		if (n == -ENODEV)
-			return; /* unbound: rx_pending stays set, IRQ re-fires */
-		if (n < 0) {
-			dev_err_ratelimited(adev->dev,
-					    "BTIF read failed (%d)\n", n);
-			return;
-		}
-		if (n == 0)
-			return; /* stream drained */
-		err = btmtk_a32_recv(adev, buf, (unsigned int)n);
-		if (err < 0) {
-			dev_err_ratelimited(adev->dev,
-					    "BTIF reassembly failed (%d); resync\n",
-					    err);
-			return;
-		}
-	}
+	adev->btif.btif_irq_requested = false;
+	spin_lock_init(&adev->btif.tx_lock);
 }
 
 /* ------------------------------------------------------------------
@@ -527,8 +702,8 @@ static void btmtk_a32_btif_drain(struct btmtk_a32_dev *adev)
  * BGF_LPCTL followed by write-1-clear of BGF_IRQ_STAT; sleep completion
  * = FW_OWN_SET bit in BGF_IRQ_STAT2 after HOST_SET (OWNER_STATE_SYNC is
  * HW-asserted without FW ack and must NOT gate sleep-done). Register
- * windows come from conninfra at runtime; NULL bases fail LOUDLY with
- * -ENODEV (TODO-CONNINFRA) -- no guessed addresses, ever.
+ * windows are DT-mapped at probe ("csr" reg); a NULL window can only
+ * mean probe was bypassed -- still LOUD, never blind.
  * ------------------------------------------------------------------
  */
 
@@ -547,7 +722,7 @@ static int btmtk_a32_fw_own_clr(struct btmtk_a32_dev *adev)
 
 	if (!csr) {
 		dev_err(adev->dev,
-			"FW-own clear without CSR window (TODO-CONNINFRA)\n");
+			"FW-own clear without CSR window (DT reg \"csr\" not mapped; probe must have failed)\n");
 		return -ENODEV;
 	}
 	while (retry-- > 0) {
@@ -581,7 +756,7 @@ static int btmtk_a32_fw_own_set(struct btmtk_a32_dev *adev)
 
 	if (!csr) {
 		dev_err(adev->dev,
-			"FW-own set without CSR window (TODO-CONNINFRA)\n");
+			"FW-own set without CSR window (DT reg \"csr\" not mapped; probe must have failed)\n");
 		return -ENODEV;
 	}
 	while (retry-- > 0) {
@@ -803,34 +978,81 @@ static int btmtk_a32_fw_stage(struct btmtk_a32_dev *adev, unsigned int slot)
  * btmtk_a32_fw_emi_commit() - copy staged bodies to EMI.
  * @adev: driver context.
  *
- * The memcpy_toio() half of __download_patch_to_emi(): each staged body
- * lands at (conninfra EMI AP base + header emi_addr offset). The base is
- * conninfra-allocated at runtime (conninfra_get_phy_addr analogue,
- * TODO-CONNINFRA); without it the commit FAILS LOUDLY -- a staged patch
- * is never executed in place and never pushed over HCI.
+ * The memcpy_toio() half of __download_patch_to_emi()
+ * (connac2/btmtk_mt66xx.c:929-...): each staged body lands at (EMI pool
+ * base + header emi_addr offset). The pool is the board's
+ * "memory-region" (<&consys_reserve>, the SAME 0x440000 pool the W4
+ * stack uses for FW patch/log/coredump EMI -- wmt_allocate_connsys_emi
+ * parses "memory-region"), resolved here with the standard reserved-mem
+ * lookup (no conninfra driver needed for the mapping itself). Every
+ * blob is bounds-checked against the pool size (btmtk_a32_fw_fit --
+ * the downstream range gate, enforced rather than elided); a miss FAILS
+ * LOUDLY and probe is REFUSED -- a staged patch is never executed in
+ * place and never pushed over HCI.
  *
- * Return: 0 committed, -ENODEV without the EMI window.
+ * Missing input when this fails: the board DTS must include the BT
+ * fragment (which carries memory-region) AND the consys_reserve pool,
+ * sized to cover the largest header offset + body.
+ *
+ * Return: 0 committed, negative errno otherwise.
  */
 static int btmtk_a32_fw_emi_commit(struct btmtk_a32_dev *adev)
 {
+	struct device_node *rmem_np;
+	struct reserved_mem *rmem;
+	void __iomem *pool;
+	unsigned long pool_size;
 	unsigned int pos;
+	int err = 0;
 
-	if (!adev->btif.bgf_base) {
+	rmem_np = of_parse_phandle(adev->dev->of_node, "memory-region", 0);
+	if (!rmem_np) {
 		dev_err(adev->dev,
-			"firmware EMI commit without BGF/EMI window (TODO-CONNINFRA: conninfra EMI base); probe REFUSED\n");
+			"firmware EMI commit without memory-region: board DTS must include the BT fragment + consys_reserve pool; probe REFUSED (TODO-EMI-POOL)\n");
 		return -ENODEV;
 	}
+	rmem = of_reserved_mem_lookup(rmem_np);
+	of_node_put(rmem_np);
+	if (!rmem) {
+		dev_err(adev->dev,
+			"firmware EMI commit: memory-region has no reserved_mem; probe REFUSED (TODO-EMI-POOL)\n");
+		return -ENODEV;
+	}
+	if (!rmem->size || rmem->size > ULONG_MAX)
+		return -EINVAL;
+	pool_size = (unsigned long)rmem->size;
+
+	pool = devm_memremap(adev->dev, rmem->base, pool_size,
+			     MEMREMAP_WC);
+	if (IS_ERR(pool)) {
+		err = PTR_ERR(pool);
+		dev_err(adev->dev,
+			"firmware EMI commit: pool memremap failed (%d); probe REFUSED\n",
+			err);
+		return err;
+	}
+
 	for (pos = 0; pos < (unsigned int)BTMTK_A32_FW_COUNT; pos++) {
 		int slot = btmtk_a32_fw_send_order(pos);
+		unsigned int len;
+		u32 off;
 
 		if (slot < 0 || !adev->fw_body[(unsigned int)slot])
 			return -EINVAL;
-		/* ioremap(conninfra EMI base + offset) + memcpy_toio()
-		 * lands here once TODO-CONNINFRA supplies the base.
-		 */
-		memcpy_toio(adev->btif.bgf_base + adev->fw_emi_off[(unsigned int)slot],
-			    adev->fw_body[(unsigned int)slot],
-			    adev->fw_len[(unsigned int)slot]);
+		off = adev->fw_emi_off[(unsigned int)slot];
+		len = (unsigned int)adev->fw_len[(unsigned int)slot];
+		err = btmtk_a32_fw_fit((unsigned int)pool_size, off, len);
+		if (err < 0) {
+			dev_err(adev->dev,
+				"firmware slot %d outside EMI pool (off 0x%08x len %u vs pool %lu); probe REFUSED\n",
+				slot, off, len, pool_size);
+			return err;
+		}
+		memcpy_toio(pool + off, adev->fw_body[(unsigned int)slot],
+			    len);
+		dev_info(adev->dev,
+			 "firmware slot %d committed to EMI (off 0x%08x len %u)\n",
+			 slot, off, len);
 	}
 	return 0;
 }
@@ -999,7 +1221,8 @@ static void btmtk_a32_irq_set(struct btmtk_a32_dev *adev, bool wakeup,
  * SUBSYS schedules the subsys-reset work (rst_trigger_work analogue);
  * WHOLE/BUS_HANG are LOUD whole-chip-reset territory (conninfra-owned,
  * TODO-CONNINFRA wires the trigger); FW_LOG drains via the FW-log hook
- * (NULL = LOUD once, TODO-CONNINFRA: connsys_log_irq_handler path).
+ * (NULL = LOUD once, TODO-CONNINFRA-LOG: connsys_log_irq_handler path
+ * needs the conninfra debug driver).
  * A NULL BGF window fails LOUDLY (-ENODEV) -- an un-acked level line is
  * reported, never masked-and-forgotten.
  */
@@ -1011,7 +1234,7 @@ static void btmtk_a32_sw_ack(struct btmtk_a32_dev *adev)
 
 	if (!bgf) {
 		dev_err_ratelimited(adev->dev,
-				    "SW IRQ with no BGF window: status unread, source NOT acked (TODO-CONNINFRA)\n");
+				    "SW IRQ with no BGF window: status unread, source NOT acked (DT reg \"bgf\" not mapped; probe must have failed)\n");
 		return;
 	}
 	status = readl(bgf + BTMTK_A32_BGF_SW_IRQ_STATUS_OFF);
@@ -1029,17 +1252,17 @@ static void btmtk_a32_sw_ack(struct btmtk_a32_dev *adev)
 		writel(BTMTK_A32_BGF_FW_LOG_NOTIFY,
 		       bgf + BTMTK_A32_BGF_SW_IRQ_RESET_OFF);
 		dev_info(adev->dev,
-			 "SW IRQ: FW_LOG_NOTIFY (status 0x%08x); FW-log drain unbound (TODO-CONNINFRA)\n",
+			"SW IRQ: FW_LOG_NOTIFY (status 0x%08x); FW-log drain unbound (TODO-CONNINFRA-LOG: connsys_log_irq_handler needs the conninfra debug driver)\n",
 			 status);
 		break;
 	case BTMTK_A32_SW_WHOLE_RESET:
 		dev_err(adev->dev,
-			"SW IRQ: WHOLE_CHIP_RESET (status 0x%08x); whole-chip reset trigger unbound (TODO-CONNINFRA)\n",
+			"SW IRQ: WHOLE_CHIP_RESET (status 0x%08x); whole-chip reset trigger unbound (TODO-CONNINFRA-PWR: needs the conninfra reset provider)\n",
 			status);
 		break;
 	case BTMTK_A32_SW_BUS_HANG:
 		dev_err(adev->dev,
-			"SW IRQ: bus-hang sentinel (status 0x%08x); dump+reset unbound (TODO-CONNINFRA)\n",
+			"SW IRQ: bus-hang sentinel (status 0x%08x); dump+reset unbound (TODO-CONNINFRA-PWR: needs the conninfra reset provider)\n",
 			status);
 		schedule_work(&adev->rst_work);
 		break;
@@ -1087,10 +1310,12 @@ static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
 		/* FW has data (btmtk_irq.c:198). Ack = FW-own clear (the
 		 * downstream NORMAL_TR leg: disable-arm taken back by the
 		 * PSM, FW-own clear, consume rx_ind at
-		 * btmtk_btif_main.c:1320-1360), then drain the BTIF stream
-		 * into reassembly. A failed FW-own clear leaves the PSM
-		 * state UNCHANGED (FW_OWN_FAIL, cf. :1323-1342) and keeps
-		 * rx_pending so the next IRQ re-fires the drain.
+		 * btmtk_btif_main.c:1320-1360). RX bytes themselves arrive
+		 * through the BTIF-block IRQ handler (RBR drain -> recv),
+		 * so no polled drain exists here -- downstream
+		 * mtk_wcn_btif_read() likewise returns 0. A failed FW-own
+		 * clear leaves the PSM state UNCHANGED (FW_OWN_FAIL, cf.
+		 * :1323-1342).
 		 */
 		err = btmtk_a32_fw_own_clr(adev);
 		if (err < 0) {
@@ -1102,7 +1327,6 @@ static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
 			return IRQ_HANDLED;
 		}
 		adev->rx_pending = false;
-		btmtk_a32_btif_drain(adev);
 		schedule_work(&adev->tx_work);
 	} else {
 		/* SW IRQ: FW assert / FW-log notify (btmtk_irq.c:199).
@@ -1118,7 +1342,7 @@ static irqreturn_t btmtk_a32_irq_thread(int irq, void *arg)
  * @work: work struct (&adev->rst_work).
  *
  * bt_reset_work analogue (btmtk_irq.c:70-...): subsys reset at
- * RESET_LEVEL_0_5 via the conninfra reset hook (TODO-CONNINFRA wires
+ * RESET_LEVEL_0_5 via the conninfra reset hook (TODO-CONNINFRA-PWR wires
  * bt_chip_reset_flow). Until then: LOUD, once per fire.
  */
 static void btmtk_a32_rst_work(struct work_struct *work)
@@ -1127,7 +1351,7 @@ static void btmtk_a32_rst_work(struct work_struct *work)
 		container_of(work, struct btmtk_a32_dev, rst_work);
 
 	dev_err(adev->dev,
-		"subsys reset trigger with no reset hook (TODO-CONNINFRA: bt_chip_reset_flow)\n");
+		"subsys reset trigger with no reset hook (TODO-CONNINFRA-PWR: bt_chip_reset_flow needs the conninfra reset provider)\n");
 }
 
 /**
@@ -1161,12 +1385,17 @@ static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev)
  * Host-side analogue of btmtk_set_wakeup() and the SLEEP wakeup leg
  * (btmtk_btif_main.c:1320-1346: disarm IRQ, FW-own clear, -> NORMAL_TR)
  * with a bounded wake hold standing in for the downstream "bt_psm" lock
- * hold across the wakeup window. FW-own failure is LOUD; the PSM state
- * is then left unchanged (FW_OWN_FAIL).
+ * hold across the wakeup window. The AP->CONNSYS WAK pulse
+ * (hal_btif_raise_wak_sig analogue) goes out BEFORE the FW-own clear so
+ * the controller notices host traffic after sleep. FW-own failure is
+ * LOUD; the PSM state is then left unchanged (FW_OWN_FAIL).
  */
 static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev)
 {
-	int err = btmtk_a32_fw_own_clr(adev);
+	int err;
+
+	btmtk_a32_btif_wake_pulse(adev);
+	err = btmtk_a32_fw_own_clr(adev);
 
 	if (err < 0) {
 		adev->psm_state = btmtk_a32_psm_next(adev->psm_state,
@@ -1283,6 +1512,129 @@ static void btmtk_a32_irq_request(struct btmtk_a32_dev *adev)
 }
 
 /**
+ * btmtk_a32_hw_map() - map DT windows, clocks and the BTIF IRQ.
+ * @adev: driver context.
+ *
+ * §1 production mapping, ALL DT-sourced (fragment values evidenced in
+ * the .dtsi header comment): BTIF PIO window ("btif"), CONN_HOST_CSR
+ * window ("csr"), BGF status window ("bgf") via
+ * devm_platform_ioremap_resource_byname(); "btifc"/"apdmac" clocks via
+ * devm_clk_get + clk_prepare (hal_btif_clk_get_and_prepare analogue);
+ * BTIF-block IRQ via platform_get_irq_byname (number AND trigger come
+ * from the specifier, like _btif_set_default_setting). Clocks are only
+ * prepared here; open enables them. The BTIF IRQ is only resolved here;
+ * open requests it. ANY absence fails probe LOUDLY with the exact
+ * missing input -- windows/clocks/IRQ are load-bearing, never optional.
+ *
+ * Return: 0 mapped, negative errno otherwise.
+ */
+static int btmtk_a32_hw_map(struct btmtk_a32_dev *adev)
+{
+	struct platform_device *pdev = to_platform_device(adev->dev);
+	int err;
+
+	adev->btif.base = devm_platform_ioremap_resource_byname(pdev,
+								"btif");
+	if (IS_ERR(adev->btif.base)) {
+		err = PTR_ERR(adev->btif.base);
+		adev->btif.base = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"btif\" reg window (fragment must carry the evidenced 0x1100c000 PIO window): %d\n",
+			err);
+		return err;
+	}
+	adev->btif.csr_base = devm_platform_ioremap_resource_byname(pdev,
+								    "csr");
+	if (IS_ERR(adev->btif.csr_base)) {
+		err = PTR_ERR(adev->btif.csr_base);
+		adev->btif.csr_base = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"csr\" reg window (fragment must carry the evidenced 0x18060000 CONN_HOST_CSR window): %d\n",
+			err);
+		return err;
+	}
+	adev->btif.bgf_base = devm_platform_ioremap_resource_byname(pdev,
+								    "bgf");
+	if (IS_ERR(adev->btif.bgf_base)) {
+		err = PTR_ERR(adev->btif.bgf_base);
+		adev->btif.bgf_base = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"bgf\" reg window (fragment must carry the evidenced 0x18800000 BGFSYS window): %d\n",
+			err);
+		return err;
+	}
+
+	adev->btif.clk_btif = devm_clk_get(adev->dev, "btifc");
+	if (IS_ERR(adev->btif.clk_btif)) {
+		err = PTR_ERR(adev->btif.clk_btif);
+		adev->btif.clk_btif = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"btifc\" clock (need infracfg_ao CLK_INFRA_BTIF provider + fragment clocks): %d\n",
+			err);
+		return err;
+	}
+	adev->btif.clk_apdma = devm_clk_get(adev->dev, "apdmac");
+	if (IS_ERR(adev->btif.clk_apdma)) {
+		err = PTR_ERR(adev->btif.clk_apdma);
+		adev->btif.clk_apdma = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"apdmac\" clock (need infracfg_ao CLK_INFRA_AP_DMA provider + fragment clocks): %d\n",
+			err);
+		return err;
+	}
+	err = clk_prepare(adev->btif.clk_btif);
+	if (err < 0) {
+		dev_err(adev->dev, "probe REFUSED: btifc prepare failed (%d)\n",
+			err);
+		return err;
+	}
+	err = clk_prepare(adev->btif.clk_apdma);
+	if (err < 0) {
+		dev_err(adev->dev, "probe REFUSED: apdmac prepare failed (%d)\n",
+			err);
+		clk_unprepare(adev->btif.clk_btif);
+		return err;
+	}
+
+	adev->btif.btif_irq = platform_get_irq_byname(pdev,
+						      BTMTK_A32_BTIF_IRQ_NAME);
+	if (adev->btif.btif_irq < 0) {
+		err = adev->btif.btif_irq;
+		adev->btif.btif_irq = -ENOENT;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"btif\" IRQ (fragment must carry the evidenced GIC_SPI 133 specifier): %d\n",
+			err);
+		clk_unprepare(adev->btif.clk_apdma);
+		clk_unprepare(adev->btif.clk_btif);
+		return err;
+	}
+	return 0;
+}
+
+/**
+ * btmtk_a32_hw_unmap() - undo the clk_prepare() half of btmtk_a32_hw_map().
+ * @adev: driver context.
+ *
+ * devm releases the iomaps, clocks and (devm) BGF2AP IRQs; what needs
+ * explicit undo is the prepare count (unprepare both).
+ */
+static void btmtk_a32_hw_unmap(struct btmtk_a32_dev *adev)
+{
+	if (adev->btif.clk_apdma) {
+		clk_unprepare(adev->btif.clk_apdma);
+		adev->btif.clk_apdma = NULL;
+	}
+	if (adev->btif.clk_btif) {
+		clk_unprepare(adev->btif.clk_btif);
+		adev->btif.clk_btif = NULL;
+	}
+	adev->btif.base = NULL;
+	adev->btif.csr_base = NULL;
+	adev->btif.bgf_base = NULL;
+	adev->btif.btif_irq = -ENOENT;
+}
+
+/**
  * btmtk_a32_irq_free() - undo the wakeup enable from btmtk_a32_irq_request().
  * @adev: driver context.
  *
@@ -1335,10 +1687,18 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	 */
 	btmtk_a32_transport_attach(adev);
 
+	/* §1 production mapping FIRST: BTIF/CSR/BGF windows, both clocks
+	 * (prepared), BTIF IRQ number. ANY absence fails probe LOUDLY --
+	 * these are load-bearing, never optional.
+	 */
+	err = btmtk_a32_hw_map(adev);
+	if (err < 0)
+		return err;
+
 	btmtk_a32_power_init(adev);
 
-	/* §3: DT-by-name IRQ resolution. Optional until TODO-HWIRQ closes;
-	 * absence only logs, never fails probe (offline-safe).
+	/* BGF2AP lines: DT-by-name, optional until TODO-HWIRQ closes;
+	 * absence only logs, never fails probe.
 	 */
 	btmtk_a32_irq_request(adev);
 
@@ -1359,13 +1719,16 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 			adev->fw_body[i] = NULL;
 		}
 		btmtk_a32_irq_free(adev);
+		btmtk_a32_hw_unmap(adev);
 		cancel_work_sync(&adev->rst_work);
 		return err;
 	}
 
 	hdev = hci_alloc_dev();
-	if (!hdev)
-		return -ENOMEM;
+	if (!hdev) {
+		err = -ENOMEM;
+		goto err_fw;
+	}
 
 	adev->hdev = hdev;
 	/* Neutral bus type: mainline defines NO BTIF bus constant
@@ -1392,11 +1755,18 @@ static int btmtk_a32_probe(struct platform_device *pdev)
 	if (err < 0) {
 		dev_err(&pdev->dev, "hci_register_dev failed (%d)\n", err);
 		hci_free_dev(hdev);
-		return err;
+		goto err_fw;
 	}
 
 	dev_info(&pdev->dev, "A32 BTIF HCI device registered\n");
 	return 0;
+
+err_fw:
+	btmtk_a32_fw_free(adev);
+	btmtk_a32_irq_free(adev);
+	btmtk_a32_hw_unmap(adev);
+	cancel_work_sync(&adev->rst_work);
+	return err;
 }
 
 static void btmtk_a32_fw_free(struct btmtk_a32_dev *adev)
@@ -1420,6 +1790,7 @@ static void btmtk_a32_remove(struct platform_device *pdev)
 	hci_free_dev(adev->hdev);
 	btmtk_a32_irq_free(adev);
 	btmtk_a32_fw_free(adev);
+	btmtk_a32_hw_unmap(adev);
 }
 
 static int __maybe_unused btmtk_a32_suspend(struct device *dev)

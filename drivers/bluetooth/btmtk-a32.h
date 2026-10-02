@@ -262,6 +262,138 @@ static inline int btmtk_a32_emi_offset(const struct btmtk_a32_emi_hdr *hdr)
 }
 
 /* ------------------------------------------------------------------
+ * §1 BTIF PIO block contract (pure part).
+ *
+ * The AP-side BTIF block is driven in PIO mode (no DMA engine): TX
+ * pushes bytes to THR, RX pulls bytes from RBR, both under the LSR/IER/
+ * IIR handshake. Register map + bits from the downstream BTIF HAL
+ * (btif/common/plat_inc/btif_priv.h, kernel/downstream/ -- 16550-shaped):
+ * RBR/THR +0x0, IER +0x4 (RXFEN bit0, TXEEN bit1), IIR +0x8 (NINT bit0,
+ * TX_EMPTY bit1, RX bit2, RX_TIMEOUT 0x44), FIFOCTRL +0x8 (CLR_RX bit1,
+ * CLR_TX bit2), FAKELCR +0xC (normal 0), LSR +0x14 (DR bit0, THRE bit5,
+ * TEMT bit6), SLEEP_EN +0x48, DMA_EN +0x4C (RX bit0, TX bit1, AUTORST
+ * bit2), TRI_LVL +0x60 (TX[3:0], RX[6:4], LOOP bit7), WAK +0x64 (WAK
+ * bit0), HANDSHAKE +0x6C.
+ *
+ * Sequences (downstream btif/common/, kernel/downstream/):
+ * - hw_init (hal_btif_hw_init): FAKELCR normal, handshake on, FIFOCLR
+ *   RX then TX, TRI_LVL = TX(8)|RX(1)|LOOP_DIS, loopback off, DMA TX+RX
+ *   off (= PIO), AUTORST on, TXEEN off, RXFEN on.
+ * - TX PIO (_btif_pio_write + hal_btif_send_data, legacy non-kfifo leg):
+ *   LSR TEMT -> 16 bytes room, THRE -> 16-8 = 8 bytes room, else 0;
+ *   writeb() to THR; retry budget 10.
+ * - RX IRQ (hal_btif_irq_handler + btif_rx_irq_handler): read IIR; while
+ *   RX|RX_TIMEOUT: readb() RBR into the rx_cb; TX_EMPTY tops up THR.
+ *   The IIR/RBR reads ARE the ack (16550 semantics) -- no masking.
+ * - Wake pulse (hal_btif_raise_wak_sig): CLR WAK bit, usleep 128-160
+ *   (> 1/32k period + margin), SET WAK bit -- AP->CONSYS wakeup.
+ * - FIFOs: TX 16 / RX 8 (BTIF_TX_FIFO_SIZE / BTIF_RX_FIFO_SIZE);
+ *   thresholds TX 8 / RX 1.
+ * ------------------------------------------------------------------
+ */
+
+/* BTIF PIO register offsets (relative to the BTIF window base). */
+#define BTMTK_A32_BTIF_RBR_OFF		0x00
+#define BTMTK_A32_BTIF_THR_OFF		0x00
+#define BTMTK_A32_BTIF_IER_OFF		0x04
+#define BTMTK_A32_BTIF_IIR_OFF		0x08
+#define BTMTK_A32_BTIF_FIFOCTRL_OFF	0x08
+#define BTMTK_A32_BTIF_FAKELCR_OFF	0x0C
+#define BTMTK_A32_BTIF_LSR_OFF		0x14
+#define BTMTK_A32_BTIF_SLEEP_EN_OFF	0x48
+#define BTMTK_A32_BTIF_DMA_EN_OFF	0x4C
+#define BTMTK_A32_BTIF_TRI_LVL_OFF	0x60
+#define BTMTK_A32_BTIF_WAK_OFF		0x64
+#define BTMTK_A32_BTIF_HANDSHAKE_OFF	0x6C
+
+/* IER / IIR / LSR bits. */
+#define BTMTK_A32_BTIF_IER_RXFEN	(1u << 0)
+#define BTMTK_A32_BTIF_IER_TXEEN	(1u << 1)
+#define BTMTK_A32_BTIF_IIR_NINT		(1u << 0)
+#define BTMTK_A32_BTIF_IIR_TX_EMPTY	(1u << 1)
+#define BTMTK_A32_BTIF_IIR_RX		(1u << 2)
+#define BTMTK_A32_BTIF_IIR_RX_TIMEOUT	(0x11u << 2)
+#define BTMTK_A32_BTIF_LSR_DR		(1u << 0)
+#define BTMTK_A32_BTIF_LSR_THRE		(1u << 5)
+#define BTMTK_A32_BTIF_LSR_TEMT		(1u << 6)
+
+/* FIFOCTRL / DMA_EN / TRI_LVL / WAK bits and thresholds. */
+#define BTMTK_A32_BTIF_FIFOCTRL_CLR_RX	(1u << 1)
+#define BTMTK_A32_BTIF_FIFOCTRL_CLR_TX	(1u << 2)
+#define BTMTK_A32_BTIF_DMA_EN_RX	(1u << 0)
+#define BTMTK_A32_BTIF_DMA_EN_TX	(1u << 1)
+#define BTMTK_A32_BTIF_DMA_EN_AUTORST	(1u << 2)
+#define BTMTK_A32_BTIF_TRI_TX_LVL	8u
+#define BTMTK_A32_BTIF_TRI_RX_LVL	1u
+#define BTMTK_A32_BTIF_TRI_LOOP_DIS	(0u << 7)
+#define BTMTK_A32_BTIF_WAK_BIT		(1u << 0)
+#define BTMTK_A32_BTIF_HANDSHAKE_ON	1u
+#define BTMTK_A32_BTIF_TX_FIFO_SIZE	16u
+#define BTMTK_A32_BTIF_RX_FIFO_SIZE	8u
+
+/* PIO TX retry budget (_btif_pio_write max_tx_retry). */
+#define BTMTK_A32_BTIF_PIO_TX_RETRY	10
+
+/* BTIF-block IRQ (downstream mt6768.dts btif@1100c000: "btif irq",
+ * GIC_SPI 133 LEVEL_LOW). TX/RX DMA IRQs (115/141) are NOT wired:
+ * DMA stays TODO (TODO-DMA) and unrequested lines must not be claimed.
+ */
+#define BTMTK_A32_BTIF_IRQ_NAME		"btif"
+
+/**
+ * btmtk_a32_btif_tx_room - PIO TX room from an LSR value.
+ * @lsr: BTIF_LSR register value.
+ *
+ * hal_btif_send_data room rule: TEMT -> full FIFO (16), else THRE ->
+ * FIFO minus threshold (16-8 = 8), else 0 (FIFO above threshold).
+ *
+ * Return: bytes that may be pushed to THR now.
+ */
+static inline unsigned int btmtk_a32_btif_tx_room(u32 lsr)
+{
+	if (lsr & (u32)BTMTK_A32_BTIF_LSR_TEMT)
+		return BTMTK_A32_BTIF_TX_FIFO_SIZE;
+	if (lsr & (u32)BTMTK_A32_BTIF_LSR_THRE)
+		return BTMTK_A32_BTIF_TX_FIFO_SIZE - BTMTK_A32_BTIF_TRI_TX_LVL;
+	return 0;
+}
+
+/**
+ * btmtk_a32_btif_tri_lvl - TRI_LVL register value for PIO bring-up.
+ *
+ * hal_btif_hw_init: TX threshold | RX threshold | LOOP_DIS.
+ *
+ * Return: the register value.
+ */
+static inline u32 btmtk_a32_btif_tri_lvl(void)
+{
+	return ((u32)BTMTK_A32_BTIF_TRI_TX_LVL & 0xfu) |
+	       (((u32)BTMTK_A32_BTIF_TRI_RX_LVL & 0x7u) << 4) |
+	       (u32)BTMTK_A32_BTIF_TRI_LOOP_DIS;
+}
+
+/**
+ * btmtk_a32_fw_fit - bounds-check one staged blob against the EMI pool.
+ * @pool_size: EMI pool size in bytes.
+ * @off: blob EMI offset (from btmtk_a32_emi_offset).
+ * @len: blob body length.
+ *
+ * The __download_patch_to_emi() range gate (elided downstream, enforced
+ * here): the copy must land strictly inside the pool.
+ *
+ * Return: 0 fits, -ERANGE otherwise.
+ */
+static inline int btmtk_a32_fw_fit(unsigned int pool_size, u32 off,
+				   unsigned int len)
+{
+	if (len == 0)
+		return -ERANGE;
+	if (off >= pool_size || len > pool_size - off)
+		return -ERANGE;
+	return 0;
+}
+
+/* ------------------------------------------------------------------
  * §3 BTIF transport + CONNSYS register contract (pure part).
  *
  * BTIF open/rx/TX/close shape (connac2/btmtk_btif_main.c,

@@ -63,6 +63,28 @@
  * 78 / 287 are PROVEN consys-owned and PROVEN NOT BT-driver lines:
  * wiring any of them here would be invention. TODO-HWIRQ stays until
  * the actual A32 BGF2AP->GIC routing is confirmed on hardware.
+ *
+ * §1 production resources (ALL evidenced, nothing invented):
+ * - BTIF PIO window: reg 0x1100c000/0x1000 + GIC_SPI 133 LEVEL_LOW
+ *   ("btif irq"), clocks "btifc"/"apdmac" -- downstream mt6768.dts
+ *   `btif@1100c000` node (kernel/downstream/), whose trigger the
+ *   downstream BTIF driver itself reads back from the `interrupts`
+ *   specifier (btif_plat.c:_btif_set_default_setting). The TX/RX DMA
+ *   windows (0x11000b80/0x80, 0x11000c00/0x80) and DMA IRQs (115/141)
+ *   are deliberately NOT carried: DMA stays TODO (TODO-DMA) and
+ *   unrequested lines must not be claimed. Mainline provides both
+ *   clock gates (clk-mt6768.c: CLK_INFRA_BTIF "ifr_btif" / CLK_INFRA_AP_DMA
+ *   "ifr_ap_dma"; binding header mediatek,mt6768-clk.h) consumed from
+ *   the existing &infracfg_ao provider.
+ * - CONN_HOST_CSR window 0x18060000/0x1000 (BGF_LPCTL/IRQ_STAT/IRQ_STAT2
+ *   for the FW-own handshake) and BGF window 0x18800000/0x1000
+ *   (BGF_SW_IRQ_STATUS/RESET_ADDR) -- downstream connac2
+ *   btmtk_mt66xx_reg.h:101-102 (:245 BGFSYS_BASE), kernel/downstream/.
+ * - EMI pool: memory-region = <&consys_reserve> -- the SAME 0x440000
+ *   pool the W4 stack uses for FW patch/log/coredump EMI
+ *   (mt6769t-samsung-a32.dts consys node; wmt_allocate_connsys_emi
+ *   parses "memory-region"). BT/MCU sub-offsets come from the patch
+ *   headers at runtime (verified against the pool size, never blind).
  */
 
 / {
@@ -79,14 +101,48 @@
 		 */
 		status = "disabled";
 
-		/* §3 wakeup-IRQ binding (names only; numeric resolution is
-		 * TODO-HWIRQ above -- deliberately NO `interrupts` property
-		 * until the A32 routing is hardware-confirmed). Order follows
-		 * the downstream DTS indices (btmtk_irq.c:249-269): index 0 =
-		 * wakeup (FW has data), index 1 = SW (FW assert/log).
+		/* §1 production windows. Order is binding-local
+		 * (reg-names); addresses evidenced per the header comment.
+		 * The parent bus supplies #address-cells=<2>/#size-cells=<2>
+		 * (downstream style <0 addr 0 size>).
 		 */
-		interrupt-names = "wakeup", "sw";
+		reg = <0x0 0x1100c000 0x0 0x1000>, /* btif: PIO window */
+		      <0x0 0x18060000 0x0 0x1000>, /* csr: CONN_HOST_CSR */
+		      <0x0 0x18800000 0x0 0x1000>; /* bgf: BGFSYS status */
+		reg-names = "btif", "csr", "bgf";
+
+		/* §1 BTIF-block IRQ (evidenced: downstream "btif irq").
+		 * interrupt-names carries ONLY evidenced lines: the BGF2AP
+		 * "wakeup"/"sw" names stay documented-pending (comment below)
+		 * with NO specifier until TODO-HWIRQ closes -- names and
+		 * specifiers are positional, so unwired names must not be
+		 * listed. Trigger comes from the specifier itself (downstream
+		 * BTIF driver pattern); the GIC parent is inherited from /.
+		 */
+		interrupts = <GIC_SPI 133 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "btif";
 		wakeup-source;
+
+		/* TODO-HWIRQ (pending names, NO specifiers): downstream
+		 * BGF2AP index 0 = "wakeup" (FW has data), index 1 = "sw"
+		 * (FW assert/log) of the compatible "mediatek,bt" node
+		 * (btmtk_irq.c:249-269) -- that node does not exist on
+		 * mt6768, so no specifier is written. The driver still
+		 * resolves both names (logs TODO-HWIRQ, keeps them unarmed).
+		 */
+
+		/* §1 clocks (evidenced both ends: downstream clock-names +
+		 * mainline clk-mt6768 gates). Prepared at probe, enabled at
+		 * open, disabled at close (downstream hal_btif_clk pattern).
+		 */
+		clocks = <&infracfg_ao CLK_INFRA_BTIF>,
+			 <&infracfg_ao CLK_INFRA_AP_DMA>;
+		clock-names = "btifc", "apdmac";
+
+		/* §1 EMI pool for the firmware commit (same pool the W4
+		 * stack uses; sub-offsets per patch header, size-checked).
+		 */
+		memory-region = <&consys_reserve>;
 
 		/* Firmware consumed (short basenames, no mediatek/ prefix;
 		 * expected under /lib/firmware/ -- cf. btmtk-a32.h):
