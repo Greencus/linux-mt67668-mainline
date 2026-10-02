@@ -262,6 +262,150 @@ static inline int btmtk_a32_emi_offset(const struct btmtk_a32_emi_hdr *hdr)
 }
 
 /* ------------------------------------------------------------------
+ * §1 CONNSYS power + WMT bring-up contract (pure part).
+ *
+ * Power order (W4 mt6768 COMMON_KERNEL path, kernel/wifi-6.18/
+ * common/common_main/platform/mt6768.c + compat/wmt_plat_mainline.c):
+ * pm_runtime_get_sync() over the CONN genpd (consys_hw_power_ctrl) ->
+ * regulator enables vcn18 / vcn33_bt (consys_hw_vcn18_ctrl /
+ * consys_hw_bt_vcn33_ctrl via regulator_get(pdev, "vcn18"/"vcn33_bt"))
+ * -> chipid poll: read MISC_OFF + IP_VER_OFFSET until IP_VER_ID
+ * (retry 10 x msleep 20), then log HW/FW/CONF IDs
+ * (polling_consys_chipid). Register bases: MCU_BASE 0x18002000
+ * (HW/FW IDs), MCU_TOP_MISC_OFF 0x180b1000 (IP_VER/CONF IDs) -- both in
+ * the board consys reg list (mt6769t-samsung-a32.dts).
+ *
+ * WMT FUNC_ON command (_send_wmt_power_cmd, connac2/btmtk_mt66xx.c:
+ * 1280-..., kernel/downstream/): H4 CMD 01 6F FC plen=6, WMT dir=1
+ * (HOST_TO_CHIP), opcode 0x06 (FUNC_CTRL), plen=2, subsys=0 (BT),
+ * on=1 -- full bytes 01 6F FC 06 01 06 02 00 00 01. Success event is
+ * the 0xE4 vendor event with WMT dir=2 (CHIP_TO_HOST), opcode 0x06,
+ * plen=1, status=0 (_check_wmt_evt_over_hci, btmtk_btif_main.c:1112-;
+ * status != 0 -> WMT_EVT_FAIL). Controller reset for bring-up is the
+ * standard HCI Reset (opcode 0x0C03) with its Command Complete event;
+ * the reset-complete handshake IS the ready proof (no ready completion
+ * without it).
+ * ------------------------------------------------------------------
+ */
+
+/* CONNSYS chip-ID poll (W4 mt6768.h:81-85 + polling_consys_chipid). */
+#define BTMTK_A32_CHIPID_MISC_OFF	0x180b1000u
+#define BTMTK_A32_CHIPID_MCU_OFF	0x18002000u
+#define BTMTK_A32_CHIPID_MCU_DELTA \
+	(BTMTK_A32_CHIPID_MISC_OFF - BTMTK_A32_CHIPID_MCU_OFF)
+#define BTMTK_A32_CHIPID_IP_VER_OFF	0x10u
+#define BTMTK_A32_CHIPID_IP_VER_ID	0x10020501u
+#define BTMTK_A32_CHIPID_HW_ID_OFF	0x00u
+#define BTMTK_A32_CHIPID_FW_ID_OFF	0x04u
+#define BTMTK_A32_CHIPID_CONF_ID_OFF	0x1cu
+#define BTMTK_A32_CHIPID_RETRY		10
+
+/* WMT FUNC_CTRL command (BT func-ON). */
+#define BTMTK_A32_WMT_DIR_HOST2CHIP	1u
+#define BTMTK_A32_WMT_DIR_CHIP2HOST	2u
+#define BTMTK_A32_WMT_OP_FUNC_CTRL	0x06u
+#define BTMTK_A32_WMT_EVT_VENDOR	0xE4u
+#define BTMTK_A32_WMT_SUBSYS_BT		0u
+
+/* Bring-up handshake timeouts (downstream internal-trx 2000ms /
+ * send_and_recv 2*HZ).
+ */
+#define BTMTK_A32_WMT_CMD_TIMEOUT_MS	2000
+#define BTMTK_A32_HCI_RESET_TIMEOUT_MS	2000
+
+/* Setup-phase command expectation (at most one outstanding). */
+enum btmtk_a32_setup_wait {
+	BTMTK_A32_SETUP_NONE = 0,
+	BTMTK_A32_SETUP_WMT_FUNC_ON,
+	BTMTK_A32_SETUP_HCI_RESET,
+};
+
+/**
+ * btmtk_a32_chipid_ok - chip-ID poll decision.
+ * @val: MISC_OFF + IP_VER_OFFSET register value.
+ *
+ * polling_consys_chipid loops until the read equals CONSYS_IP_VER_ID.
+ *
+ * Return: 1 powered-up, 0 keep polling.
+ */
+static inline int btmtk_a32_chipid_ok(u32 val)
+{
+	return val == (u32)BTMTK_A32_CHIPID_IP_VER_ID;
+}
+
+/**
+ * btmtk_a32_wmt_func_on - build the WMT BT func-ON command frame.
+ * @out: destination (min 10 bytes); @outlen its size.
+ *
+ * Exact _send_wmt_power_cmd(TRUE) bytes: 01 6F FC 06 01 06 02 00 00 01.
+ *
+ * Return: bytes written (10), or -ENOSPC/-EINVAL on error.
+ */
+static inline int btmtk_a32_wmt_func_on(u8 *out, unsigned int outlen)
+{
+	static const u8 cmd[] = {
+		0x01, 0x6F, 0xFC, 0x06,
+		0x01, 0x06, 0x02, 0x00,
+		0x00, 0x01,
+	};
+	unsigned int i;
+
+	if (!out || outlen < sizeof(cmd))
+		return -ENOSPC;
+	for (i = 0; i < sizeof(cmd); i++)
+		out[i] = cmd[i];
+	return (int)sizeof(cmd);
+}
+
+/**
+ * btmtk_a32_wmt_func_evt - classify a reassembled event frame.
+ * @frame: HCI event payload AFTER the H4 type byte (evt + plen + params).
+ * @flen: payload length.
+ * @op: WMT opcode the driver is waiting for (FUNC_CTRL here).
+ *
+ * _check_wmt_evt_over_hci() analogue for the FUNC_CTRL case: 0xE4 code,
+ * WMT dir CHIP_TO_HOST, matching opcode, plen >= 1; status byte decides.
+ *
+ * Return: 0 event matches with status SUCCESS, 1 matches with status
+ * FAIL, -EINVAL not a matching event (deliver to stack normally).
+ */
+static inline int btmtk_a32_wmt_func_evt(const u8 *frame, unsigned int flen,
+					 u8 op)
+{
+	if (!frame || flen < 2 + 4 + 1)
+		return -EINVAL;
+	if (frame[0] != (u8)BTMTK_A32_WMT_EVT_VENDOR)
+		return -EINVAL;
+	if (frame[2] != (u8)BTMTK_A32_WMT_DIR_CHIP2HOST)
+		return -EINVAL;
+	if (frame[3] != op)
+		return -EINVAL;
+	return frame[6] == 0 ? 0 : 1;
+}
+
+/**
+ * btmtk_a32_hci_reset_evt - classify an HCI Reset Command Complete.
+ * @frame: HCI event payload AFTER the H4 type byte.
+ * @flen: payload length.
+ *
+ * HCI Reset (0x0C03) Command Complete: evt 0x0E, ncmd, opcode LE
+ * 0x0C03, status. Status decides; anything else is -EINVAL.
+ *
+ * Return: 0 reset complete with status SUCCESS, 1 complete with status
+ * FAIL, -EINVAL not the expected event.
+ */
+static inline int btmtk_a32_hci_reset_evt(const u8 *frame, unsigned int flen)
+{
+	if (!frame || flen < 6)
+		return -EINVAL;
+	if (frame[0] != 0x0Eu)
+		return -EINVAL;
+	if (frame[3] != 0x03u || frame[4] != 0x0Cu)
+		return -EINVAL;
+	return frame[5] == 0 ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------
  * §1 BTIF PIO block contract (pure part).
  *
  * The AP-side BTIF block is driven in PIO mode (no DMA engine): TX

@@ -80,6 +80,11 @@
  *   for the FW-own handshake) and BGF window 0x18800000/0x1000
  *   (BGF_SW_IRQ_STATUS/RESET_ADDR) -- downstream connac2
  *   btmtk_mt66xx_reg.h:101-102 (:245 BGFSYS_BASE), kernel/downstream/.
+ * - MCU_TOP_MISC_OFF window 0x180b1000/0x1000 (chip-ID poll:
+ *   IP_VER/HW/FW/CONF) -- board consys reg list (MCU_TOP_MISC_OFF index)
+ *   + W4 polling_consys_chipid (kernel/wifi-6.18/).
+ * - power-domains = CONN genpd -- same binding the board consys node
+ *   uses; BT is a CONNSYS function, no invented clock IDs.
  * - EMI pool: memory-region = <&consys_reserve> -- the SAME 0x440000
  *   pool the W4 stack uses for FW patch/log/coredump EMI
  *   (mt6769t-samsung-a32.dts consys node; wmt_allocate_connsys_emi
@@ -98,6 +103,18 @@
 		/* HARDWARE-UNPROVEN gate: stays disabled until controller
 		 * discovery + firmware download + basic HCI up are proven
 		 * on A32 silicon. Flip to "okay" only then.
+		 *
+		 * §13 status decision (honesty rule): DISABLED. Every
+		 * production path (probe windows/clocks/IRQ mapping, FW
+		 * stage/verify/commit, open genpd/rails/chip-ID poll, setup
+		 * WMT FUNC_ON + reset handshake) either works or fails
+		 * loudly with probe refusing / setup refusing and all
+		 * acquired resources released -- but NONE of it has ever
+		 * executed against A32 silicon: BGF2AP numerics unproven
+		 * (TODO-HWIRQ), MCU-start writes unowned
+		 * (TODO-CONNINFRA-PWR), rails unmapped (TODO-POWER-*).
+		 * Enabling without silicon proof would claim hardware that
+		 * was never observed.
 		 */
 		status = "disabled";
 
@@ -108,8 +125,10 @@
 		 */
 		reg = <0x0 0x1100c000 0x0 0x1000>, /* btif: PIO window */
 		      <0x0 0x18060000 0x0 0x1000>, /* csr: CONN_HOST_CSR */
-		      <0x0 0x18800000 0x0 0x1000>; /* bgf: BGFSYS status */
-		reg-names = "btif", "csr", "bgf";
+		      <0x0 0x18800000 0x0 0x1000>, /* bgf: BGFSYS status */
+		      <0x0 0x180b1000 0x0 0x1000>; /* misc: MCU_TOP_MISC_OFF
+						   * (chip-ID poll) */
+		reg-names = "btif", "csr", "bgf", "misc";
 
 		/* §1 BTIF-block IRQ (evidenced: downstream "btif irq").
 		 * interrupt-names carries ONLY evidenced lines: the BGF2AP
@@ -129,6 +148,16 @@
 		 * (btmtk_irq.c:249-269) -- that node does not exist on
 		 * mt6768, so no specifier is written. The driver still
 		 * resolves both names (logs TODO-HWIRQ, keeps them unarmed).
+		 *
+		 * §13 IRQ re-check: NO new evidence resolves these numerics.
+		 * The board consys node (284/78/287) and the W4 power path
+		 * add nothing BT-driver-specific; "mediatek,bt" is still
+		 * absent on mt6768 downstream. What would close it (live
+		 * capture, all offline-unavailable): a vendor DTB decompile
+		 * showing a "mediatek,bt" node with an `interrupts`
+		 * property on THIS board; or /proc/interrupts correlation
+		 * of FW-wake/resume behavior against GIC lines on hardware;
+		 * or conninfra driver source mapping BGF2AP->GIC for 6768.
 		 */
 
 		/* §1 clocks (evidenced both ends: downstream clock-names +
@@ -143,6 +172,18 @@
 		 * stack uses; sub-offsets per patch header, size-checked).
 		 */
 		memory-region = <&consys_reserve>;
+
+		/* §1 power domain: the BT function lives inside CONNSYS, so
+		 * this node joins the same CONN genpd the consys node uses
+		 * (board DTS consys node: power-domains = <&spm
+		 * MT6768_POWER_DOMAIN_CONN>; driver pattern is the W4
+		 * COMMON_KERNEL path: pm_runtime_get_sync/put, no invented
+		 * clock IDs). Rails stay supply-gated (TODO-POWER below):
+		 * the W4 evidence names vcn18/vcn33_bt consumers on the
+		 * CONNSYS device, not on this node, so no -supply is written
+		 * here.
+		 */
+		power-domains = <&spm MT6768_POWER_DOMAIN_CONN>;
 
 		/* Firmware consumed (short basenames, no mediatek/ prefix;
 		 * expected under /lib/firmware/ -- cf. btmtk-a32.h):

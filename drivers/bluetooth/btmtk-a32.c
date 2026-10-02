@@ -67,6 +67,7 @@
 #include <linux/spinlock.h> /* §3: enable/disable active-flag lock */
 #include <linux/pm_wakeup.h> /* §3: wakeup_source + device_init_wakeup */
 #include <linux/pm.h> /* §3: SET_SYSTEM_SLEEP_PM_OPS */
+#include <linux/pm_runtime.h> /* CONN genpd attach (pm_runtime_get/put) */
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -89,9 +90,15 @@
  *   BGF_SW_IRQ_STATUS/RESET_ADDR live at +0x0150/+0x014C).
  * @csr_base: CONN_HOST_CSR window (DT reg "csr", 0x18060000/0x1000;
  *   BGF_LPCTL/IRQ_STAT/IRQ_STAT2 live at +0x0030/+0x0034/+0x003C).
+ * @misc_base: MCU_TOP_MISC_OFF window (DT reg "misc", 0x180b1000/0x1000;
+ *   chip-ID poll registers live here).
  * @clk_btif: "btifc" gate (mainline CLK_INFRA_BTIF). Prepared at probe,
  *   enabled at open, disabled at close (hal_btif_clk pattern).
  * @clk_apdma: "apdmac" gate (mainline CLK_INFRA_AP_DMA). Same handling.
+ * @reg_vcn18: vcn18 rail when mapped (W4 mt6768.c evidence), else NULL
+ *   (loud-gated sub-step; chip-ID poll arbitrates).
+ * @reg_vcn33_bt: vcn33_bt rail when mapped, else NULL (same gating).
+ * @pm_on: pm_runtime_get_sync() held (CONN genpd).
  * @btif_irq: BTIF-block IRQ (DT "btif", GIC_SPI 133 LEVEL_LOW).
  *   Requested at open, freed at close; RX IER armed with it.
  * @claimed: CONSYS_BT owner claimed (g_btif_id != 0 analogue;
@@ -112,8 +119,12 @@ struct btmtk_a32_btif {
 	void __iomem *base;
 	void __iomem *bgf_base;
 	void __iomem *csr_base;
+	void __iomem *misc_base; /* MCU_TOP_MISC_OFF (chip-ID poll) */
 	struct clk *clk_btif;
 	struct clk *clk_apdma;
+	struct regulator *reg_vcn18; /* BT-relevant rail (W4 mt6768.c) */
+	struct regulator *reg_vcn33_bt; /* BT rail (W4 mt6768.c) */
+	bool pm_on; /* pm_runtime_get_sync held */
 	int btif_irq;
 	bool claimed;
 	bool rx_registered;
@@ -155,6 +166,14 @@ struct btmtk_a32_dev {
 	unsigned int rx_target; /* full H4 length of the frame in rx_skb */
 	struct completion ready;
 	bool opened;
+	/* Setup-phase handshake (WMT FUNC_ON / HCI Reset event wait).
+	 * Armed by setup(), completed by the deliver() snoop; at most one
+	 * outstanding (downstream internal_cmd analogue).
+	 */
+	spinlock_t wmt_lock;
+	enum btmtk_a32_setup_wait setup_wait;
+	int setup_status;
+	struct completion wmt_done;
 	/* Staged firmware bodies (header stripped, CRC verified): slot i
 	 * corresponds to btmtk_a32_fw_name(i). Committed to the
 	 * memory-region EMI pool at probe (btmtk_a32_fw_emi_commit).
@@ -194,6 +213,7 @@ static int btmtk_a32_btif_open(struct device *dev, void *ctx);
 static void btmtk_a32_btif_close(struct device *dev, void *ctx);
 static int btmtk_a32_fw_own_clr(struct btmtk_a32_dev *adev);
 static int btmtk_a32_fw_own_set(struct btmtk_a32_dev *adev);
+static void btmtk_a32_connsys_power_off(struct btmtk_a32_dev *adev);
 static void btmtk_a32_fw_free(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_sleep(struct btmtk_a32_dev *adev);
 static int btmtk_a32_set_wakeup(struct btmtk_a32_dev *adev);
@@ -219,6 +239,32 @@ static int btmtk_a32_deliver(struct btmtk_a32_dev *adev, u8 type,
 {
 	struct sk_buff *skb;
 	__u8 pkt_type;
+	unsigned long flags;
+	int match = -EINVAL;
+
+	if (type == BTMTK_A32_H4_EVT) {
+		/* Setup-phase snoop (downstream event_intercept analogue):
+		 * when setup() has an armed expectation and this frame is
+		 * its handshake event, record the status, complete the
+		 * waiter and CONSUME the frame (internal handshakes are
+		 * filtered, not delivered to BlueZ). Anything else falls
+		 * through to normal delivery.
+		 */
+		spin_lock_irqsave(&adev->wmt_lock, flags);
+		if (adev->setup_wait == BTMTK_A32_SETUP_WMT_FUNC_ON)
+			match = btmtk_a32_wmt_func_evt(frame, flen,
+						       BTMTK_A32_WMT_OP_FUNC_CTRL);
+		else if (adev->setup_wait == BTMTK_A32_SETUP_HCI_RESET)
+			match = btmtk_a32_hci_reset_evt(frame, flen);
+		if (match >= 0) {
+			adev->setup_status = match;
+			adev->setup_wait = BTMTK_A32_SETUP_NONE;
+			complete(&adev->wmt_done);
+		}
+		spin_unlock_irqrestore(&adev->wmt_lock, flags);
+		if (match >= 0)
+			return 0;
+	}
 
 	switch (type) {
 	case BTMTK_A32_H4_ACL:
@@ -458,28 +504,170 @@ static int btmtk_a32_btif_send(struct device *dev, void *ctx,
 }
 
 /**
- * btmtk_a32_connsys_power_on() - BGFSYS/MCU power gate (loud TODO).
+ * btmtk_a32_rail_enable() - enable one BT-relevant PMIC rail (sub-step).
+ * @adev: driver context.
+ * @name: regulator consumer name (W4 mt6768.c evidence).
+ * @out: receives the enabled regulator, or NULL when ungated.
+ *
+ * W4 pattern (mt6768.c consys_hw_vcn18_ctrl / consys_hw_bt_vcn33_ctrl:
+ * regulator_get(pdev, "vcn18"/"vcn33_bt") + regulator_enable). Only the
+ * BT-relevant rails are attempted here (vcn28/vcn33_wifi serve FM/WLAN
+ * per the W4 co-clock comments, so they are out of scope, documented).
+ * -EPROBE_DEFER propagates (rails may appear later). A missing supply
+ * mapping (-ENODEV: fragment carries no "<name>-supply") is LOUD-gated
+ * with the exact missing input, and the sequence CONTINUES -- the
+ * chip-ID poll below is the ground truth for power (rails may already
+ * be owned by the W4 consys driver). An enable failure is likewise loud
+ * (the poll then decides).
+ *
+ * Return: 0 (enabled or loud-gated), -EPROBE_DEFER when deferred.
+ */
+static int btmtk_a32_rail_enable(struct btmtk_a32_dev *adev,
+				 const char *name, struct regulator **out)
+{
+	struct regulator *reg;
+	int err;
+
+	*out = NULL;
+	reg = regulator_get(adev->dev, name);
+	if (IS_ERR(reg)) {
+		err = PTR_ERR(reg);
+		if (err == -EPROBE_DEFER)
+			return err;
+		dev_err(adev->dev,
+			"rail \"%s\" unmapped (fragment needs \"%s-supply\" + PMIC provider; W4 evidence: mt6768.c regulator_get(pdev, \"%s\")); continuing to chip-ID poll (TODO-POWER-%s)\n",
+			name, name, name, name);
+		return 0;
+	}
+	err = regulator_enable(reg);
+	if (err < 0) {
+		dev_err(adev->dev,
+			"rail \"%s\" enable failed (%d); continuing to chip-ID poll\n",
+			name, err);
+		regulator_put(reg);
+		return 0;
+	}
+	*out = reg;
+	return 0;
+}
+
+/**
+ * btmtk_a32_mcu_reg() - MCU_BASE-window register from the MISC mapping.
+ * @adev: driver context.
+ * @off: offset within MCU_BASE (HW/FW ID registers).
+ *
+ * The HW/FW version IDs live in MCU_BASE (0x18002000), which has no
+ * dedicated mapping; both window addresses are evidenced, so the
+ * MCU address is derived from the mapped MISC window by the evidenced
+ * inter-window delta (never a fresh guess).
+ */
+static void __iomem *btmtk_a32_mcu_reg(struct btmtk_a32_dev *adev, u32 off)
+{
+	return (void __iomem *)((u8 __iomem *)adev->btif.misc_base -
+				BTMTK_A32_CHIPID_MCU_DELTA + off);
+}
+
+/**
+ * btmtk_a32_connsys_power_on() - REAL CONNSYS power attempt sequence.
  * @adev: driver context.
  *
- * The bt_hw_and_mcu_on() BGFSYS power-on + MCU-start half runs on
- * conninfra power: conninfra_pwr_on(CONNDRV_TYPE_BT) (downstream
- * btmtk_set_power_on: conninfra_pwr_on BEFORE anything else). There is
- * NO in-repo provider (kernel/wifi-6.18 exports no conninfra_pwr_on;
- * no in-tree conninfra/connfem power driver), so this FAILS LOUDLY
- * with the exact missing input instead of pretending power is on.
- * BTIF clocks (ours, mainline-gated) are NOT a substitute and are
- * handled separately.
+ * W4 mt6768 COMMON_KERNEL order (mt6768.c consys_hw_power_ctrl +
+ * polling_consys_chipid, kernel/wifi-6.18/): pm_runtime_get_sync() over
+ * the CONN genpd (fragment power-domains, same binding the board consys
+ * node uses) -> vcn18 + vcn33_bt rail sub-steps (loud-gated per rail)
+ * -> chip-ID poll (MISC_OFF + 0x10 until 0x10020501, 10 x 20ms), then
+ * log HW/FW/CONF IDs. The poll is the arbiter: success proves CONNSYS
+ * is powered and answering; failure tears the attempt down (rails off,
+ * runtime put) and returns -ENODEV LOUDLY. No unconditional -ENODEV on
+ * entry; no fake success (an unpowered chip cannot spoof its ID
+ * register).
  *
- * Missing input: in-tree conninfra power driver (or conninfra.ko)
- * exporting conninfra_pwr_on(), bound to the consys DT node.
+ * Still missing (exact inputs, unchanged): the explicit BGFSYS MCU-start
+ * register writes, which live in the conninfra power driver
+ * (conninfra_pwr_on, no in-repo provider -- verified). MCU execution is
+ * therefore proven one level up, by the WMT FUNC_ON handshake in setup()
+ * (a non-running FW cannot answer it), not pretended here.
  *
- * Return: 0 powered (once a provider exists), -ENODEV without one.
+ * Return: 0 powered, negative errno otherwise.
  */
 static int btmtk_a32_connsys_power_on(struct btmtk_a32_dev *adev)
 {
-	dev_err(adev->dev,
-		"CONNSYS power-on unbound: need conninfra_pwr_on(CONNDRV_TYPE_BT) provider (in-tree conninfra driver or conninfra.ko); BTIF clocks alone cannot start BGFSYS/MCU (TODO-CONNINFRA-PWR)\n");
-	return -ENODEV;
+	unsigned int retry = BTMTK_A32_CHIPID_RETRY;
+	u32 val;
+	int err;
+
+	err = pm_runtime_get_sync(adev->dev);
+	if (err < 0) {
+		dev_err(adev->dev,
+			"CONNSYS power: pm_runtime_get_sync failed (%d; need the CONN genpd provider + fragment power-domains)\n",
+			err);
+		pm_runtime_put_noidle(adev->dev);
+		return err;
+	}
+	adev->btif.pm_on = true;
+
+	err = btmtk_a32_rail_enable(adev, "vcn18", &adev->btif.reg_vcn18);
+	if (err < 0)
+		goto err_pm;
+	err = btmtk_a32_rail_enable(adev, "vcn33_bt",
+				    &adev->btif.reg_vcn33_bt);
+	if (err < 0)
+		goto err_pm;
+
+	while (retry-- > 0) {
+		val = readl(adev->btif.misc_base +
+			    BTMTK_A32_CHIPID_IP_VER_OFF);
+		if (btmtk_a32_chipid_ok(val))
+			break;
+		msleep(20);
+	}
+	if (!btmtk_a32_chipid_ok(val)) {
+		dev_err(adev->dev,
+			"CONNSYS power: chip-ID poll failed (last 0x%08x, want 0x%08x); chip never came up\n",
+			val, BTMTK_A32_CHIPID_IP_VER_ID);
+		err = -ENODEV;
+		goto err_pm;
+	}
+	dev_info(adev->dev,
+		 "CONNSYS powered: IP_VER 0x%08x HW 0x%04x FW 0x%04x CONF 0x%x\n",
+		 val,
+		 readl(btmtk_a32_mcu_reg(adev,
+					BTMTK_A32_CHIPID_HW_ID_OFF)) & 0xffffu,
+		 readl(btmtk_a32_mcu_reg(adev,
+					BTMTK_A32_CHIPID_FW_ID_OFF)) & 0xffffu,
+		 readl(adev->btif.misc_base +
+		       BTMTK_A32_CHIPID_CONF_ID_OFF) & 0xfu);
+	return 0;
+
+err_pm:
+	btmtk_a32_connsys_power_off(adev);
+	return err;
+}
+
+/**
+ * btmtk_a32_connsys_power_off() - undo btmtk_a32_connsys_power_on().
+ * @adev: driver context.
+ *
+ * Reverse order, best-effort (teardown path): rails off + put, then the
+ * runtime put that balances the get_sync. Safe to call when power was
+ * never fully acquired (NULL rails / pm_on clear are skipped).
+ */
+static void btmtk_a32_connsys_power_off(struct btmtk_a32_dev *adev)
+{
+	if (adev->btif.reg_vcn33_bt) {
+		regulator_disable(adev->btif.reg_vcn33_bt);
+		regulator_put(adev->btif.reg_vcn33_bt);
+		adev->btif.reg_vcn33_bt = NULL;
+	}
+	if (adev->btif.reg_vcn18) {
+		regulator_disable(adev->btif.reg_vcn18);
+		regulator_put(adev->btif.reg_vcn18);
+		adev->btif.reg_vcn18 = NULL;
+	}
+	if (adev->btif.pm_on) {
+		pm_runtime_put(adev->dev);
+		adev->btif.pm_on = false;
+	}
 }
 
 /**
@@ -645,8 +833,9 @@ err_claim:
  * @ctx: &adev.
  *
  * mtk_wcn_btif_close() + btif_close() analogue: drop the RX callback
- * (rx_cb = NULL analogue), mask RX IER, free the BTIF IRQ, disable both
- * clocks, release the owner claim (g_btif_id = 0 analogue).
+ * (rx_cb = NULL analogue), mask RX IER, free the BTIF IRQ, power the
+ * CONNSYS attempt down (rails off + runtime put), disable both clocks,
+ * release the owner claim (g_btif_id = 0 analogue).
  */
 static void btmtk_a32_btif_close(struct device *dev, void *ctx)
 {
@@ -667,6 +856,7 @@ static void btmtk_a32_btif_close(struct device *dev, void *ctx)
 		free_irq(adev->btif.btif_irq, adev);
 		adev->btif.btif_irq_requested = false;
 	}
+	btmtk_a32_connsys_power_off(adev);
 	clk_disable_unprepare(adev->btif.clk_apdma);
 	clk_disable_unprepare(adev->btif.clk_btif);
 	adev->btif.claimed = false;
@@ -1086,18 +1276,116 @@ static int btmtk_a32_load_firmware(struct btmtk_a32_dev *adev)
 	return btmtk_a32_fw_emi_commit(adev);
 }
 
+/**
+ * btmtk_a32_setup_cmd() - send one bring-up command, wait for its event.
+ * @adev: driver context (transport claimed: setup runs after hdev->open).
+ * @cmd: H4-framed command bytes (type byte included).
+ * @len: command length.
+ * @wait: expectation to arm (WMT_FUNC_ON or HCI_RESET).
+ * @timeout_ms: event wait budget.
+ *
+ * Downstream _send_wmt_power_cmd shape: arm the expectation, push the
+ * command on the BTIF stream, wait for the handshake event
+ * (deliver() snoop completes wmt_done). ANY failure -- send error,
+ * timeout, controller-reported FAIL -- returns LOUDLY negative and
+ * leaves setup_wait disarmed (deliver() then treats late events as
+ * normal traffic, never completing a stale waiter).
+ *
+ * Return: 0 handshake success, negative errno otherwise.
+ */
+static int btmtk_a32_setup_cmd(struct btmtk_a32_dev *adev,
+			       const u8 *cmd, unsigned int len,
+			       enum btmtk_a32_setup_wait wait,
+			       unsigned int timeout_ms)
+{
+	unsigned long flags;
+	unsigned long left;
+	int err;
+
+	spin_lock_irqsave(&adev->wmt_lock, flags);
+	adev->setup_wait = wait;
+	adev->setup_status = -ETIMEDOUT;
+	reinit_completion(&adev->wmt_done);
+	spin_unlock_irqrestore(&adev->wmt_lock, flags);
+
+	err = adev->transport.send(adev->dev, adev->transport.ctx, cmd, len);
+	if (err < 0) {
+		spin_lock_irqsave(&adev->wmt_lock, flags);
+		adev->setup_wait = BTMTK_A32_SETUP_NONE;
+		spin_unlock_irqrestore(&adev->wmt_lock, flags);
+		bt_dev_err(adev->hdev, "setup: command push failed (%d)\n",
+			   err);
+		return err;
+	}
+
+	left = wait_for_completion_timeout(&adev->wmt_done,
+					   msecs_to_jiffies(timeout_ms));
+	spin_lock_irqsave(&adev->wmt_lock, flags);
+	adev->setup_wait = BTMTK_A32_SETUP_NONE;
+	err = adev->setup_status;
+	spin_unlock_irqrestore(&adev->wmt_lock, flags);
+
+	if (!left) {
+		bt_dev_err(adev->hdev,
+			   "setup: handshake event timeout (%ums, wait %d); controller not answering\n",
+			   timeout_ms, wait);
+		return -ETIMEDOUT;
+	}
+	if (err != 0) {
+		bt_dev_err(adev->hdev,
+			   "setup: controller reported handshake FAIL (wait %d)\n",
+			   wait);
+		return -EIO;
+	}
+	return 0;
+}
+
 static int btmtk_a32_setup(struct hci_dev *hdev)
 {
 	struct btmtk_a32_dev *adev = hci_get_drvdata(hdev);
+	u8 cmd[16];
+	int err;
 
 	/* Firmware is already staged + EMI-committed at probe (which fails
-	 * LOUDLY otherwise, so setup never runs without it). What remains
-	 * is the post-patch bring-up: BGFSYS power-on, WMT func-ON
-	 * (btmtk_intcmd_wmt_power_on analogue), controller reset sequencing
-	 * and the ready indication (FUNC_ON state). The WMT command half
-	 * rides the now-attached BTIF transport; the ready completion below
-	 * is the FUNC_ON event.
+	 * LOUDLY otherwise, so setup never runs without it), and the
+	 * transport was claimed by hdev->open just before init. What
+	 * remains is the live bring-up, in downstream order
+	 * (btmtk_intcmd_wmt_power_on analogue): WMT BT func-ON first
+	 * (a non-running FW cannot answer it -- this is also the MCU-start
+	 * proof), then the controller reset, then -- and ONLY then -- the
+	 * ready completion (FUNC_ON analogue). ANY step failing fails
+	 * setup LOUDLY: no ready, no hciX-UP on a dead controller.
 	 */
+	err = btmtk_a32_wmt_func_on(cmd, sizeof(cmd));
+	if (err < 0)
+		return err;
+	err = btmtk_a32_setup_cmd(adev, cmd, (unsigned int)err,
+				  BTMTK_A32_SETUP_WMT_FUNC_ON,
+				  BTMTK_A32_WMT_CMD_TIMEOUT_MS);
+	if (err < 0) {
+		bt_dev_err(hdev, "setup REFUSED: WMT FUNC_ON failed (%d)\n",
+			   err);
+		return err;
+	}
+	bt_dev_info(hdev, "WMT BT func-ON acknowledged\n");
+
+	/* Controller reset: standard HCI Reset with Command Complete
+	 * handshake; the reset-complete event IS the ready proof.
+	 */
+	{
+		static const u8 rst[] = { 0x01, 0x03, 0x0C, 0x00 };
+
+		err = btmtk_a32_setup_cmd(adev, rst, sizeof(rst),
+					  BTMTK_A32_SETUP_HCI_RESET,
+					  BTMTK_A32_HCI_RESET_TIMEOUT_MS);
+		if (err < 0) {
+			bt_dev_err(hdev,
+				   "setup REFUSED: controller reset failed (%d)\n",
+				   err);
+			return err;
+		}
+	}
+
 	complete_all(&adev->ready);
 	bt_dev_info(hdev, "controller ready indication\n");
 	return 0;
@@ -1438,6 +1726,10 @@ static void btmtk_a32_irq_request(struct btmtk_a32_dev *adev)
 	int irq, err;
 
 	spin_lock_init(&adev->irq_lock);
+	spin_lock_init(&adev->wmt_lock);
+	init_completion(&adev->wmt_done);
+	adev->setup_wait = BTMTK_A32_SETUP_NONE;
+	adev->setup_status = 0;
 	adev->wake_irq = -ENOENT;
 	adev->sw_irq = -ENOENT;
 	adev->wake_active = false;
@@ -1517,9 +1809,11 @@ static void btmtk_a32_irq_request(struct btmtk_a32_dev *adev)
  *
  * §1 production mapping, ALL DT-sourced (fragment values evidenced in
  * the .dtsi header comment): BTIF PIO window ("btif"), CONN_HOST_CSR
- * window ("csr"), BGF status window ("bgf") via
- * devm_platform_ioremap_resource_byname(); "btifc"/"apdmac" clocks via
- * devm_clk_get + clk_prepare (hal_btif_clk_get_and_prepare analogue);
+ * window ("csr"), BGF status window ("bgf"), MCU_TOP_MISC_OFF window
+ * ("misc", chip-ID poll) via devm_platform_ioremap_resource_byname();
+ * "btifc"/"apdmac" clocks via devm_clk_get + clk_prepare
+ * (hal_btif_clk_get_and_prepare analogue); CONN genpd via
+ * devm_pm_runtime_enable (W4 COMMON_KERNEL pattern);
  * BTIF-block IRQ via platform_get_irq_byname (number AND trigger come
  * from the specifier, like _btif_set_default_setting). Clocks are only
  * prepared here; open enables them. The BTIF IRQ is only resolved here;
@@ -1560,6 +1854,16 @@ static int btmtk_a32_hw_map(struct btmtk_a32_dev *adev)
 		adev->btif.bgf_base = NULL;
 		dev_err(adev->dev,
 			"probe REFUSED: no \"bgf\" reg window (fragment must carry the evidenced 0x18800000 BGFSYS window): %d\n",
+			err);
+		return err;
+	}
+	adev->btif.misc_base = devm_platform_ioremap_resource_byname(pdev,
+								     "misc");
+	if (IS_ERR(adev->btif.misc_base)) {
+		err = PTR_ERR(adev->btif.misc_base);
+		adev->btif.misc_base = NULL;
+		dev_err(adev->dev,
+			"probe REFUSED: no \"misc\" reg window (fragment must carry the evidenced 0x180b1000 MCU_TOP_MISC_OFF window for the chip-ID poll): %d\n",
 			err);
 		return err;
 	}
@@ -1608,6 +1912,19 @@ static int btmtk_a32_hw_map(struct btmtk_a32_dev *adev)
 		clk_unprepare(adev->btif.clk_btif);
 		return err;
 	}
+
+	/* CONN genpd attach (fragment power-domains; W4 COMMON_KERNEL
+	 * pattern). devm handles disable; get/put pairs with power_on/off.
+	 */
+	err = devm_pm_runtime_enable(adev->dev);
+	if (err < 0) {
+		dev_err(adev->dev,
+			"probe REFUSED: pm_runtime_enable failed (%d)\n",
+			err);
+		clk_unprepare(adev->btif.clk_apdma);
+		clk_unprepare(adev->btif.clk_btif);
+		return err;
+	}
 	return 0;
 }
 
@@ -1631,6 +1948,7 @@ static void btmtk_a32_hw_unmap(struct btmtk_a32_dev *adev)
 	adev->btif.base = NULL;
 	adev->btif.csr_base = NULL;
 	adev->btif.bgf_base = NULL;
+	adev->btif.misc_base = NULL;
 	adev->btif.btif_irq = -ENOENT;
 }
 
