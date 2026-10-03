@@ -1268,7 +1268,7 @@
 				 <&infracfg_ao CLK_INFRA_MSDC0>,
 				 <&infracfg_ao CLK_INFRA_MSDC0_SRC>,
 				 <&infracfg_ao CLK_INFRA_FAES_FDE>;
-			clock-names = "source", "hclk", "source_cg", "crypto_clk";
+			clock-names = "source", "hclk", "source_cg", "crypto";
 			status = "disabled";
 		};
 
