@@ -140,30 +140,108 @@
 };
 
 /* eMMC: measured (11230000.msdc, mmcblk0 boot device, mtk_emmc_support=1).
- * Conservative first bring-up: HS200 only. HS400 + hs400-ds-delay are
- * board delay-line tuning — NOT copied, TODO-MMC-HS400. Pinmux omitted:
- * LK leaves MSDC0 muxed (boot device); Linux reuses reset state. TODO-MMC-PIN. */
+ * P0 BLOCKER FIX (mtk-sd.c:3033-3048): probe does pinctrl_lookup_state for
+ * "default" + "state_uhs" and hard-fails (probe abort, no eMMC) without
+ * them. Both states are wired below via new &pio MSDC0 groups.
+ * Mux reference: same-SoC xiaomi-common dtsi (GPIO122-133 MSDC0 funcs;
+ * mt6768-pinfunc.h: PINMUX_GPIO122__FUNC_MSDC0_CMD ... _MSDC0_RSTB).
+ * drive/bias are reset defaults (properties OMITTED): Redmi drive values
+ * are board tuning, NOT copied. TODO-MMC-PIN: measure/verify drive on A32.
+ * Conservative first-boot profile: HS/DDR52 ceiling (52MHz), no HS200, no
+ * CMDQ, no HW-reset. HS200 restore ladder: docs/PHYSICAL-BOOT-GATE.md
+ * TODO-MMC-HS200 (clean mmc_test + write-verify first). */
 &mmc0 {
 	status = "okay"; /* measured */
+	pinctrl-names = "default", "state_uhs"; /* measured-blocker fix: mtk-sd.c:3033-3048 */
+	pinctrl-0 = <&mmc0_default_pins>; /* same-SoC mux ref: xiaomi-common dtsi */
+	pinctrl-1 = <&mmc0_uhs_pins>; /* same-SoC mux ref: xiaomi-common dtsi */
 	bus-width = <8>; /* measured: eMMC (JEDEC 8-bit) */
-	max-frequency = <200000000>; /* inferred: HS200 ceiling for bring-up */
+	max-frequency = <52000000>; /* inferred: conservative HS/DDR52 first-boot ceiling (was HS200 200MHz; TODO-MMC-HS200) */
 	cap-mmc-highspeed; /* SoC-common */
 	mmc-ddr-1_8v; /* SoC-common */
-	mmc-hs200-1_8v; /* inferred: bring-up ceiling (see HS400 TODO above) */
-	cap-mmc-hw-reset; /* SoC-common */
+	/* mmc-hs200-1_8v REMOVED for first boot: restore per TODO-MMC-HS200 after clean mmc_test + write-verify */
+	/* cap-mmc-hw-reset REMOVED for first boot: RSTB pin defined below but reset path unproven; restore with HS200 */
 	no-sdio; /* board-specific: eMMC slot, no SDIO */
 	no-sd; /* board-specific: eMMC slot, no SD */
 	non-removable; /* board-specific: soldered eMMC */
-	supports-cqe; /* SoC-common: command queue engine */
+	/* supports-cqe REMOVED for first boot: no CMDQ until HS200 proven; restore with HS200 */
 	vmmc-supply = <&mt6358_vemc_reg>; /* vendor-derived: eMMC power rail, family pattern */
 	vqmmc-supply = <&mt6358_vio18_reg>; /* vendor-derived: eMMC IO rail, family pattern */
+};
+
+/* MSDC0 pin groups (P0 blocker fix, see &mmc0 above). Same-SoC mux
+ * reference only (xiaomi-common dtsi): GPIO122 CMD, GPIO123/128/125/132/
+ * 126/129/127/130 DAT0-7, GPIO124 CLK, GPIO131 DSL, GPIO133 RSTB
+ * (mt6768-pinfunc.h MSDC0 funcs). drive/bias OMITTED = reset defaults;
+ * default and uhs groups are intentionally identical until TODO-MMC-PIN
+ * measures A32 drive requirements (xiaomi points both states at default;
+ * we keep two labels so the uhs state exists for the mtk-sd lookup). */
+&pio {
+	mmc0_default_pins: mmc0-default-pins {
+		pins-clk {
+			pinmux = <PINMUX_GPIO124__FUNC_MSDC0_CLK>; /* same-SoC mux ref */
+		};
+
+		pins-cmd-dat {
+			pinmux = <PINMUX_GPIO123__FUNC_MSDC0_DAT0>, /* same-SoC mux ref */
+				 <PINMUX_GPIO128__FUNC_MSDC0_DAT1>, /* same-SoC mux ref */
+				 <PINMUX_GPIO125__FUNC_MSDC0_DAT2>, /* same-SoC mux ref */
+				 <PINMUX_GPIO132__FUNC_MSDC0_DAT3>, /* same-SoC mux ref */
+				 <PINMUX_GPIO126__FUNC_MSDC0_DAT4>, /* same-SoC mux ref */
+				 <PINMUX_GPIO129__FUNC_MSDC0_DAT5>, /* same-SoC mux ref */
+				 <PINMUX_GPIO127__FUNC_MSDC0_DAT6>, /* same-SoC mux ref */
+				 <PINMUX_GPIO130__FUNC_MSDC0_DAT7>, /* same-SoC mux ref */
+				 <PINMUX_GPIO122__FUNC_MSDC0_CMD>; /* same-SoC mux ref */
+			input-enable; /* functional (DAT input), not drive tuning */
+		};
+
+		pins-ds {
+			pinmux = <PINMUX_GPIO131__FUNC_MSDC0_DSL>; /* same-SoC mux ref */
+		};
+
+		pins-rst {
+			pinmux = <PINMUX_GPIO133__FUNC_MSDC0_RSTB>; /* same-SoC mux ref */
+		};
+	};
+
+	mmc0_uhs_pins: mmc0-uhs-pins {
+		pins-clk {
+			pinmux = <PINMUX_GPIO124__FUNC_MSDC0_CLK>; /* same-SoC mux ref */
+		};
+
+		pins-cmd-dat {
+			pinmux = <PINMUX_GPIO123__FUNC_MSDC0_DAT0>, /* same-SoC mux ref */
+				 <PINMUX_GPIO128__FUNC_MSDC0_DAT1>, /* same-SoC mux ref */
+				 <PINMUX_GPIO125__FUNC_MSDC0_DAT2>, /* same-SoC mux ref */
+				 <PINMUX_GPIO132__FUNC_MSDC0_DAT3>, /* same-SoC mux ref */
+				 <PINMUX_GPIO126__FUNC_MSDC0_DAT4>, /* same-SoC mux ref */
+				 <PINMUX_GPIO129__FUNC_MSDC0_DAT5>, /* same-SoC mux ref */
+				 <PINMUX_GPIO127__FUNC_MSDC0_DAT6>, /* same-SoC mux ref */
+				 <PINMUX_GPIO130__FUNC_MSDC0_DAT7>, /* same-SoC mux ref */
+				 <PINMUX_GPIO122__FUNC_MSDC0_CMD>; /* same-SoC mux ref */
+			input-enable; /* functional (DAT input), not drive tuning */
+		};
+
+		pins-ds {
+			pinmux = <PINMUX_GPIO131__FUNC_MSDC0_DSL>; /* same-SoC mux ref */
+		};
+
+		pins-rst {
+			pinmux = <PINMUX_GPIO133__FUNC_MSDC0_RSTB>; /* same-SoC mux ref */
+		};
+	};
 };
 
 /* mmc1 (SD slot): merlin cd-gpios pio18 NOT copied (Redmi-specific).
  * A32 slot presence + card-detect GPIO unknown. OMITTED. TODO-SD. */
 
+/* STORAGE-FIRST SMOKE TEST (reversible): GPU/MFG gated so a display/GPU
+ * fault can never mask eMMC/R1 diagnosis on first boot. Re-enable path:
+ * flip &gpu + &mfg_async + &mfg below back to "okay" together (all three;
+ * MFG domains default off with no consumer) once mmcblk0 + RNDIS-SSH are
+ * proven. Documented in docs/FIRST-BOOT-OBSERVABILITY.md. */
 &gpu {
-	status = "okay"; /* inferred: G52 present (0x13040000, 2EE) */
+	status = "disabled"; /* board-specific: storage-first gate (was okay; inferred G52 present) */
 	mali-supply = <&mt6358_vgpu_reg>; /* inferred: family pattern (xiaomi-common:208) */
 };
 
@@ -187,10 +265,12 @@
 };
 
 &mfg_async {
+	status = "disabled"; /* board-specific: storage-first gate, re-enable with &gpu (see above) */
 	domain-supply = <&mt6358_vsram_gpu_reg>; /* inferred: family pattern */
 };
 
 &mfg {
+	status = "disabled"; /* board-specific: storage-first gate, re-enable with &gpu (see above) */
 	domain-supply = <&mt6358_vgpu_reg>; /* inferred: family pattern */
 };
 
@@ -199,12 +279,16 @@
  * real entry from mt6769t-samsung-a32-panel.dtsi (included above), per that
  * fragment's MERGE INSTRUCTION: stub node removed, #address-cells/#size-cells
  * and panel@0 (compatible "samsung,s6e3fc3-a32", LCD_RST=pio45,
- * LCD_1P8_EN=pio25, LCD_3P0_EN=pio153) come from the fragment, and &dsi0 is
- * flipped to "okay" below. Panel itself stays HARDWARE-UNPROVEN (TODO-PANEL).
- * Integration states: dsi0/panel ENABLED (unproven); modem-ccci DISABLED;
+ * LCD_1P8_EN=pio25, LCD_3P0_EN=pio153) come from the fragment.
+ * STORAGE-FIRST SMOKE TEST (reversible): &dsi0 gated to "disabled" so
+ * panel/GPU cannot mask eMMC/R1 diagnosis on first boot; the panel@0 child
+ * is inert while its parent is disabled (driver + binding stay in tree).
+ * Re-enable path: flip &dsi0 back to "okay" once mmcblk0 + RNDIS-SSH are
+ * proven (TODO-PANEL hardware proof still required regardless).
+ * Integration states: dsi0/panel GATED (storage-first); modem-ccci DISABLED;
  * bluetooth-a32 DISABLED; usb2 musb ENABLED. */
 &dsi0 {
-	status = "okay"; /* board-specific: enabled per Track D merge instruction */
+	status = "disabled"; /* board-specific: storage-first gate (was okay per Track D merge) */
 };
 
 &dsi_out {
@@ -223,6 +307,17 @@
  * the CONN genpd instead); resets (no evidenced mt6768 CCIF reset ID on
  * mainline; downstream mt6768 has no store_reset_control — only mt6853
  * has one, wrong silicon); pinctrl/ant-swap GPIO (A32 pins unknown). */
+/* PRE-FLASH RESERVE MAP (A32 evidence only; every line cites its source).
+ * Stock source: Samsung 4.14 tree mt6768.dts (verbatim addrs/sizes).
+ * Live source: live-reserved-map.txt (34 nodes probed on THIS phone,
+ * device-backup-20261002-183552/metadata/live-android/).
+ * Sanity rule applied per node: addresses must sit inside
+ * 0x40000000-0x140000000 (all below do; nothing stopped).
+ * Overlap rule: fixed regions verified pairwise-contiguous, not
+ * overlapping (sec-log family 0x46C-0x478 contiguous; ram_console/
+ * pstore/minirdump 0x4D000000-0x4D100000 contiguous; framebuffer/
+ * gz-log/SSPM/log_store/gz 0x7C720000-0x80000000 contiguous).
+ * TODO-MEMRSV CLOSED by this block (was: modem/scp carveouts unknown). */
 &{/reserved-memory} {
 	consys_reserve: consys-reserve-memory {
 		compatible = "mediatek,consys-reserve-memory"; /* vendor-derived: DTB:370 */
@@ -238,6 +333,253 @@
 		size = <0x0 0x300000>; /* vendor-derived: DTB:380 */
 		alignment = <0x0 0x1000000>; /* vendor-derived: DTB:381 */
 		alloc-ranges = <0x0 0x40000000 0x0 0x80000000>; /* vendor-derived: DTB:382 */
+	};
+
+	/* Stock sec-log family (6 nodes, Samsung 4.14 mt6768.dts:312-336
+	 * verbatim; each confirmed live at the same addr/size). no-map:
+	 * firmware log agents own these; Linux must not clobber them. */
+	sec_log: sec-log-reserve-memory@46c00000 {
+		reg = <0x0 0x46c00000 0x0 0x200000>; /* stock:312-316 + live:18 */
+		no-map; /* pre-flash safety: SEC log region */
+	};
+
+	sec_lastklog: sec-lastklog@46e00000 {
+		reg = <0x0 0x46e00000 0x0 0x200000>; /* stock:318-320 + live:9 */
+		no-map; /* pre-flash safety: SEC lastklog region */
+	};
+
+	sec_logger: sec-logger-reserve-memory@47000000 {
+		reg = <0x0 0x47000000 0x0 0x400000>; /* stock:322-324 + live:14 */
+		no-map; /* pre-flash safety: SEC logger region */
+	};
+
+	sec_autocomment: sec-autocomment-reserve-memory@47400000 {
+		reg = <0x0 0x47400000 0x0 0x10000>; /* stock:326-328 + live:22 */
+		no-map; /* pre-flash safety: SEC autocomment region */
+	};
+
+	sec_extrainfo: sec-extrainfo-reserve-memory@47410000 {
+		reg = <0x0 0x47410000 0x0 0x1f0000>; /* stock:330-332 + live:17 */
+		no-map; /* pre-flash safety: SEC extrainfo region */
+	};
+
+	sec_initlog: sec-initlog-reserve-memory@47600000 {
+		reg = <0x0 0x47600000 0x0 0x200000>; /* stock:334-336 + live:8 */
+		no-map; /* pre-flash safety: SEC initlog region */
+	};
+
+	/* Stock rdx_bootdev (Samsung 4.14 mt6768.dts:339-344 verbatim;
+	 * stock node label says @A0000000 but reg is 0xA9000000 — label
+	 * corrected to match reg; in range: 0xA9000000 < 0x140000000). */
+	sec_rdx_bootdev: sec_rdx_bootdev@a9000000 {
+		compatible = "mediatek,sec_rdx_bootdev"; /* stock:340 */
+		reg = <0x0 0xa9000000 0x0 0x4000000>; /* stock:342 */
+		no-map; /* pre-flash safety: RD dump boot device window */
+	};
+
+	/* Stock + live cccimdee (stock:362-365 verbatim; live:3 same
+	 * addr/size). no-map (task-mandated; stock/live map it but the EE
+	 * dump agent owns it — driver ioremaps when CCCI enables). */
+	cccimdee: cccimdee-reserved-memory@4ae3e000 {
+		compatible = "mediatek,ccci-md-ee-dump"; /* stock:363 + live:3 */
+		reg = <0x0 0x4ae3e000 0x0 0x1c2000>; /* stock:364 + live:3 */
+		no-map; /* pre-flash safety: modem EE dump region */
+	};
+
+	/* Live ATF trio (live:11,2,27; all live-flagged no-map). */
+	atf_reserved: atf-reserved@4ce00000 {
+		reg = <0x0 0x4ce00000 0x0 0x60000>; /* live:11 */
+		no-map; /* live:11 no-map (ATF owns) */
+	};
+
+	atf_log: atf-log@bff00000 {
+		reg = <0x0 0xbff00000 0x0 0x40000>; /* live:2 */
+		no-map; /* live:2 no-map (ATF log) */
+	};
+
+	atf_ramdump: atf-ramdump@bff70000 {
+		reg = <0x0 0xbff70000 0x0 0x80000>; /* live:27 */
+		no-map; /* live:27 no-map (ATF ramdump) */
+	};
+
+	/* Live TEE pair (live:16,28; both live-flagged no-map). */
+	tee_secmem: tee-secmem@7ac00000 {
+		reg = <0x0 0x7ac00000 0x0 0x400000>; /* live:16 */
+		no-map; /* live:16 no-map (TEE secure mem) */
+	};
+
+	tee_reserved: tee-reserved@75400000 {
+		reg = <0x0 0x75400000 0x0 0x5800000>; /* live:28 */
+		no-map; /* live:28 no-map (TEE reserved) */
+	};
+
+	/* Live modem trio (live:25,32,12). Live maps these (no no-map
+	 * flag) for AP-side modem access; first-boot reserves them no-map
+	 * for safety (CCCI driver ioremaps when TODO-CCCI-PROBE enables
+	 * the transport). Documented divergence, reversible. */
+	md_mem_usage: md_mem_usage@64000000 {
+		reg = <0x0 0x64000000 0x0 0x10000000>; /* live:25 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	ap_md_nc_smem: ap_md_nc_smem@60000000 {
+		reg = <0x0 0x60000000 0x0 0x910000>; /* live:32 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	ap_md_c_smem: ap_md_c_smem@5e000000 {
+		reg = <0x0 0x5e000000 0x0 0x1600000>; /* live:12 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	ccci_tag: ccci_tag_mem@9fff0000 {
+		reg = <0x0 0x9fff0000 0x0 0x10000>; /* live:6 */
+		no-map; /* live:6 no-map (CCCI tag) */
+	};
+
+	/* Live SPM (live:7, no-map). Adjacent to tee-reserved
+	 * (0x753F0000+0x10000 = 0x75400000) — no overlap. */
+	spm_reserved: spm-reserved@753f0000 {
+		reg = <0x0 0x753f0000 0x0 0x10000>; /* live:7 */
+		no-map; /* live:7 no-map (SPM owns) */
+	};
+
+	/* Live pl-bootarg (live:20, live maps it — bootloader args stay
+	 * readable; kept mapped). */
+	pl_bootarg: pl-bootarg@4c080000 {
+		reg = <0x0 0x4c080000 0x0 0x200000>; /* live:20 */
+	};
+
+	/* Live ram_console (live:1 flags no-map; kept MAPPED per bring-up
+	 * decision so the kernel can read the previous-boot console log —
+	 * first-boot forensics path, see FIRST-BOOT-OBSERVABILITY). */
+	ram_console: ram_console@4d000000 {
+		reg = <0x0 0x4d000000 0x0 0x10000>; /* live:1 */
+	};
+
+	/* Live pstore as ramoops (live:34 flags no-map; kept MAPPED:
+	 * pstore/ramoops needs normal mapping to record panics. Console +
+	 * record + ftrace + pmsg (0xC0000) fit inside 0xE0000. Backend is
+	 * still CONFIG_PSTORE_RAM=m (module) — see observability doc. */
+	ramoops_pstore: ramoops@4d010000 {
+		compatible = "ramoops"; /* bring-up: pstore backend binding */
+		reg = <0x0 0x4d010000 0x0 0xe0000>; /* live:34 */
+		record-size = <0x0 0x40000>; /* bring-up: dmesg records */
+		console-size = <0x0 0x40000>; /* bring-up: console log */
+		ftrace-size = <0x0 0x20000>; /* bring-up: ftrace log */
+		pmsg-size = <0x0 0x20000>; /* bring-up: pmsg log */
+	};
+
+	/* Live minirdump + log_store + mrdump pair (all no-map). log_store
+	 * and dtb_mrdump are live-mapped but reserved no-map for first
+	 * boot (documented divergence, reversible). */
+	minirdump: minirdump@4d0f0000 {
+		reg = <0x0 0x4d0f0000 0x0 0x10000>; /* live:4 */
+		no-map; /* live:4 no-map */
+	};
+
+	log_store: log_store@7ebc0000 {
+		reg = <0x0 0x7ebc0000 0x0 0x40000>; /* live:33 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	lk_mrdump: lk_mrdump@4c400000 {
+		reg = <0x0 0x4c400000 0x0 0x500000>; /* live:29 */
+		no-map; /* live:29 no-map */
+	};
+
+	dtb_mrdump: dtb_mrdump@4bc80000 {
+		reg = <0x0 0x4bc80000 0x0 0x80000>; /* live:30 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	/* Live GZ pair (live:15,5; both live-flagged no-map). */
+	gz_mem: gz@7ec00000 {
+		reg = <0x0 0x7ec00000 0x0 0x1400000>; /* live:15 */
+		no-map; /* live:15 no-map (Gunyah owns) */
+	};
+
+	gz_log: gz-log@7ea00000 {
+		reg = <0x0 0x7ea00000 0x0 0x41000>; /* live:5 */
+		no-map; /* live:5 no-map (GZ log) */
+	};
+
+	/* Live SCP: fixed 6MB node (live:21) PLUS the stock scp_share pool
+	 * below (A32 override size 0xD00000 = 13MB). SUPERSET choice: the
+	 * pool reserves the stock size (allocatable, no invented address)
+	 * while the fixed node pins the live address — together they cover
+	 * both claims; neither overlaps the other (pool has no fixed reg).
+	 * Revisit when SCP firmware needs are measured. */
+	scp_fixed: scp-reserved@9f900000 {
+		reg = <0x0 0x9f900000 0x0 0x600000>; /* live:21 */
+		no-map; /* live:21 no-map (SCP owns) */
+	};
+
+	scp_share: reserve-memory-scp_share {
+		compatible = "mediatek,reserve-memory-scp_share"; /* stock:381 */
+		no-map; /* stock:382 */
+		size = <0x0 0xd00000>; /* A32 override (stock base 0x300000:383; 13MB superset) */
+		alignment = <0x0 0x1000000>; /* stock:384 */
+		alloc-ranges = <0x0 0x40000000 0x0 0x50000000>; /* stock:385 */
+	};
+
+	/* Live SSPM: fixed 0xC0000 node (live:13) PLUS the stock
+	 * sspm_share pool below (default 0x510000; GMO 0x110000 variant
+	 * noted, default taken). SUPERSET choice, same reasoning as SCP
+	 * above: pool reserves the stock size, fixed node pins the live
+	 * address (0x7EB00000 + live size ends 0x7EBC0000, exactly where
+	 * log_store starts — contiguous, no overlap). */
+	sspm_fixed: sspm-reserved@7eb00000 {
+		reg = <0x0 0x7eb00000 0x0 0xc0000>; /* live:13 */
+		no-map; /* live:13 no-map (SSPM owns) */
+	};
+
+	sspm_share: reserve-memory-sspm_share {
+		compatible = "mediatek,reserve-memory-sspm_share"; /* stock:368 */
+		no-map; /* stock:369 */
+		size = <0x0 0x510000>; /* stock default:373 (GMO 0x110000 not taken) */
+		alignment = <0x0 0x10000>; /* stock:375 */
+		alloc-ranges = <0x0 0x40000000 0x0 0x60000000>; /* stock:376 */
+	};
+
+	/* Live RKP trio (live:10,23,26; all live-mapped, reserved no-map
+	 * for first boot — hypervisor/KASLR regions; documented
+	 * divergence, reversible). All inside range (0xD0000000-0xD1401000
+	 * < 0x140000000). */
+	rkp: rkp@d0000000 {
+		reg = <0x0 0xd0000000 0x0 0x100000>; /* live:10 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	rkp_ns: rkp_ns@d0100000 {
+		reg = <0x0 0xd0100000 0x0 0x1300000>; /* live:23 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	kaslr: kaslr@d1400000 {
+		reg = <0x0 0xd1400000 0x0 0x1000>; /* live:26 */
+		no-map; /* pre-flash safety (live maps; see above) */
+	};
+
+	/* Live dramc-rk pair (live:19,24; tiny 1-page SRAM-adjacent
+	 * nodes, both live-flagged no-map). dramc-rk1 at 0x13FFFF000 is
+	 * inside range (< 0x140000000). */
+	dramc_rk0: dramc-rk0@bffff000 {
+		reg = <0x0 0xbffff000 0x0 0x1000>; /* live:19 */
+		no-map; /* live:19 no-map */
+	};
+
+	dramc_rk1: dramc-rk1@13ffff000 {
+		reg = <0x1 0x3ffff000 0x0 0x1000>; /* live:24 (0x13FFFF000 = <0x1 0x3FFFF000>; 64-bit cell split, NOT truncated) */
+		no-map; /* live:24 no-map */
+	};
+
+	/* Live framebuffer (live:31): RESERVE-ONLY no-map. Display is NOT
+	 * enabled from it (dsi0 gated storage-first); the reserve simply
+	 * stops Linux from clobbering the LK splash framebuffer. */
+	framebuffer_reserve: framebuffer@7c720000 {
+		reg = <0x0 0x7c720000 0x0 0x22e0000>; /* live:31 */
+		no-map; /* reserve-only: LK splash preserved, display not enabled */
 	};
 };
 
@@ -318,6 +660,8 @@
  * i2c7 willsemi TCPC (Redmi-specific) TODO-USB-ROLE;
  * spi0 nt36672a touch + spi3 cs35l41 amp (Redmi peripherals) TODO-TOUCH TODO-AUDIO;
  * devapc/dvfsrc enables (left at SoC default) TODO-DVFS;
- * mmc1 SD slot (cd-gpio unknown) TODO-SD;
- * memory reservations beyond memory@ (modem/scp carveouts unknown) TODO-MEMRSV.
+ * mmc1 SD slot (cd-gpio unknown) TODO-SD.
+ * CLOSED here: TODO-MEMRSV (modem/scp/TEE/ATF/log reserves from live +
+ * stock evidence in &{/reserved-memory} above); TODO-MMC-PIN partially
+ * (MSDC0 mux wired, drive tuning still open).
  */
