@@ -1377,7 +1377,9 @@ static void __init do_basic_setup(void)
 	driver_init();
 	init_irq_proc();
 	do_ctors();
+	pr_info("A32-BREADCRUMB: do-basic-setup enter (initcalls next)\n");
 	do_initcalls();
+	pr_info("A32-BREADCRUMB: do-initcalls done\n");
 }
 
 static void __init do_pre_smp_initcalls(void)

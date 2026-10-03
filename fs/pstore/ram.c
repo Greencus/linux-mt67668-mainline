@@ -730,6 +730,8 @@ static int ramoops_probe(struct platform_device *pdev)
 	phys_addr_t paddr;
 	int err = -EINVAL;
 
+	pr_info("A32-BREADCRUMB: ramoops-probe-enter\n");
+
 	/*
 	 * Only a single ramoops area allowed at a time, so fail extra
 	 * probes.
@@ -868,6 +870,8 @@ static int ramoops_probe(struct platform_device *pdev)
 	pr_info("using 0x%lx@0x%llx, ecc: %d\n",
 		cxt->size, (unsigned long long)cxt->phys_addr,
 		cxt->ecc_info.ecc_size);
+
+	pr_info("A32-BREADCRUMB: ramoops-probe-ok\n");
 
 	return 0;
 

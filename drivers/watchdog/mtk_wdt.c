@@ -402,6 +402,8 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 	const struct mtk_wdt_data *wdt_data;
 	int err, irq;
 
+	pr_info("A32-BREADCRUMB: wdt-probe-enter\n");
+
 	mtk_wdt = devm_kzalloc(dev, sizeof(*mtk_wdt), GFP_KERNEL);
 	if (!mtk_wdt)
 		return -ENOMEM;
@@ -465,6 +467,8 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 
 	mtk_wdt->reset_by_toprgu =
 		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
+
+	pr_info("A32-BREADCRUMB: wdt-probe-ok\n");
 
 	return 0;
 }
