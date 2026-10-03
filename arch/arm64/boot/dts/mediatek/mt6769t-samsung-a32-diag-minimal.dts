@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Minimal early-boot diagnostic DT for Samsung Galaxy A32 (SM-A325M).
+ *
+ * Purpose: shrink the pre-/init probe surface to CPU/SMP/GIC/timer/UART/
+ * RAM/watchdog/pstore + minimal pwrap/regulator/clock infra ONLY, so a
+ * still-30s vs alive-60s read-out discriminates "kernel never reached"
+ * from "kernel runs" (see docs/BUGS.md P1/W1). The initramfs never mounts
+ * SUPER, so NO storage is needed and MMC stays disabled.
+ *
+ * Base: mt6768.dtsi DIRECTLY (not the board file, not mt6769t.dtsi): the
+ * diagnostic keeps the safe 1.7GHz little-cluster ceiling. mt6358.dtsi is
+ * included (PMIC measured present; keeps the pwrap path intact) WITHOUT
+ * any board consumers or always-on additions, so all non-always-on rails
+ * stay off (vio18 alone is always-on by vendor design, mt6358.dtsi).
+ *
+ * Left at SoC default (already disabled in mt6768.dtsi, not restated):
+ * i2c0-8, spi0-5, uart1, keyboard, devapc, dvfsrc, mmc1 (SD slot).
+ * Absent by construction (board-file-only, never included here): BT,
+ * CCCI/modem, consys+wifi, panel/s6e3fc3, GPU regulator always-on
+ * overrides, full reserve map, connsys PMIC cell. (t-phy + MMC pinctrl
+ * groups live in the SoC file: t-phy is already disabled there and only
+ * the board turns it on; the port nodes are restated-disabled below.)
+ *
+ * Tag legend: SoC-common | board-specific | measured | inferred.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include "mt6768.dtsi" /* SoC base: cpus/GIC/timers/clocks/pio/scpsys on by default */ /* SoC-common */
+#include "mt6358.dtsi" /* MT6358 companion PMIC, measured on this unit; no consumers added */ /* measured */
+
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic minimal)"; /* board-specific */
+	compatible = "samsung,a32-diag-minimal", "mediatek,mt6769t", "mediatek,mt6768"; /* board-specific */
+
+	aliases {
+		serial0 = &uart0; /* board-specific */
+	};
+
+	chosen {
+		stdout-path = &uart0; /* board-specific: serial console, no cmdline addition needed */
+	};
+
+	memory@40000000 {
+		device_type = "memory"; /* SoC-common */
+		reg = <0x0 0x40000000 0x1 0x0>; /* measured: 4GB unit, LK trims usable */
+	};
+};
+
+/* pstore forensics, same geometry as production (ram_console kept mapped
+ * so the previous-boot console log stays readable; ramoops backend is
+ * built into the diagnostic kernel via scripts/diag-pstore.fragment). */
+&{/reserved-memory} {
+	ram_console: ram_console@4d000000 {
+		reg = <0x0 0x4d000000 0x0 0x10000>; /* measured */
+	};
+
+	ramoops_pstore: ramoops@4d010000 {
+		compatible = "ramoops"; /* board-specific: pstore backend binding */
+		reg = <0x0 0x4d010000 0x0 0xe0000>; /* measured */
+		record-size = <0x0 0x40000>; /* board-specific */
+		console-size = <0x0 0x40000>; /* board-specific */
+		ftrace-size = <0x0 0x20000>; /* board-specific */
+		pmsg-size = <0x0 0x20000>; /* board-specific */
+	};
+};
+
+&uart0 {
+	status = "okay"; /* board-specific: console UART (needs &apdma, left enabled) */
+};
+
+/* toprgu stays ENABLED: DT-disable cannot stop a running WDT (no
+ * EN-clear path, mtk_wdt.c) and the pet loop needs /dev/watchdog.
+ * See docs/BUGS.md W1. */
+
+/* GPU + MFG clock/power path: fully gated (storage-first parity). */
+&gpu {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&mfgcfg {
+	status = "disabled"; /* board-specific: enabled on a consumer-less MFG_ASYNC domain (BUGS.md C5) */
+};
+
+&mfg_async {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&mfg {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+/* Display + DSI/PHY + PWMs: fully gated (BUGS.md C1/C4). mipi_tx0/dsi0
+ * restated although already disabled in the SoC file, for intent. */
+&dsi0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&mipi_tx0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&pwm0 {
+	status = "disabled"; /* board-specific: unneeded + carries the C1 provider fix */
+};
+
+&pwm1 {
+	status = "disabled"; /* board-specific: unneeded */
+};
+
+/* USB device path: MUSB + t-phy + all four SoC PHY ports off (no RNDIS
+ * on this image; the pet loop skips USB when no UDC exists). t-phy is
+ * already disabled in the SoC file (only the board fragment enables
+ * it); restated here for intent together with its ports. */
+&usb2 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&usb2phy {
+	status = "disabled"; /* board-specific: diagnostic gate (already disabled in SoC file; restated) */
+};
+
+&usb2port0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&usb2port1 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&usb2port2 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&usb2port3 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+/* Storage: initramfs never mounts SUPER — eMMC stays off. mmc1
+ * restated although already disabled in the SoC file, for intent. */
+&mmc0 {
+	status = "disabled"; /* board-specific: no storage needed on this image */
+};
+
+&mmc1 {
+	status = "disabled"; /* board-specific: SD slot unknown, stays off */
+};
+
+/* Sensors/thermal: AuxADC + thermal zones off (no sensor consumers). */
+&thermal {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&auxadc {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+/* Display pipeline clocks/SMI/IOMMU/GCE: all off (BUGS.md C4). */
+&mmsys {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&smi_common {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&iommu {
+	status = "disabled"; /* board-specific: no IOMMU consumers on this image */
+};
+
+&gce {
+	status = "disabled"; /* board-specific: no GCE consumers on this image */
+};
+
+&larb0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&ovl0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&ovl_2l0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&rdma0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&wdma0 {
+	status = "disabled"; /* board-specific: diagnostic gate (also lacks power-domains) */
+};
+
+&color0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&ccorr0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&aal0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&gamma0 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&dither0 {
+	status = "disabled"; /* board-specific: diagnostic gate (also lacks power-domains) */
+};
+
+&mutex {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+/* Camera/video/ISP clock domains + larbs + JPEG: all off. */
+&imgsys {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&larb2 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&vdecsys {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&larb1 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&vencsys {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&larb4 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&venc_jpg {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&camsys {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+&larb3 {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
+
+/* SCP coprocessor: needs firmware, off (path ref: node has no label). */
+&{/scp@10500000} {
+	status = "disabled"; /* board-specific: diagnostic gate */
+};
