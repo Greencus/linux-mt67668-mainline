@@ -13,7 +13,7 @@
 /dts-v1/;
 
 #include <dt-bindings/gpio/gpio.h>
-#include "mt6768.dtsi" /* pulls mt6768.dtsi + 1.8GHz cluster0 OPP */ /* SoC-common */
+#include "mt6769t.dtsi" /* pulls mt6768.dtsi + 1.8GHz cluster0 OPP (opp0-1800000000); A32 SoC is MT6769T */ /* SoC-common */
 #include "mt6358.dtsi" /* MT6358 companion PMIC, measured on this unit */ /* measured */
 #include "mt6769t-samsung-a32-ccci.dtsi" /* Track A: modem-ccci DISABLED until TODO-CCCI-PROBE */ /* board-specific */
 #include "mt6769t-samsung-a32-bt.dtsi" /* Track B: bluetooth-a32 DISABLED until BTIF gates close */ /* board-specific */
