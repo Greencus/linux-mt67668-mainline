@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: gic-departition / pmOS-flatten (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Deltas (pmOS DTB reference:
+ * references/PMOS-WORKINGBUILD/pmos-a32-heimdall/dtbs/mt6768.dtb —
+ * gic #interrupt-cells = <3>, no ppi-partitions node, gic interrupts
+ * <PPI 9 LEVEL_HIGH> 3-cell, timer PPIs 3-cell each, single
+ * arm,armv8-pmuv3 with <PPI 7 LEVEL_LOW> 3-cell):
+ *   &gic { /delete-node/ ppi-partitions; #interrupt-cells = <3>; }
+ *   plus dropping the 4th cell everywhere a PPI references the removed
+ *   partitions: the gic maintenance IRQ (<GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH
+ *   0> -> 3-cell), the armv8-timer PPIs (13/14/11/10, trailing 0
+ *   dropped), and both PMU PPIs (&ppi_cluster0/1 phandle dropped).
+ * The /timer + /pmu-a55 + /pmu-a75 nodes carry no labels in mt6768.dtsi,
+ * so they are overridden by root-path merge. dsu-pmu (GIC_SPI) untouched.
+ * Isolates whether the hang rides GIC PPI-partition/affinity routing:
+ * if this image survives where the sink died, partitioning was the fault.
+ *
+ * Distinct board identity below (board a32-ewdt-gicflat, 16 chars).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&gic {
+	#interrupt-cells = <3>;
+	interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+	/delete-node/ ppi-partitions;
+};
+
+/ {
+	timer {
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW>;
+	};
+	pmu-a55 {
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+	};
+	pmu-a75 {
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, gic-flatten)";
+	compatible = "samsung,a32-diag-ewdt-gicflat", "mediatek,mt6769t", "mediatek,mt6768";
+};

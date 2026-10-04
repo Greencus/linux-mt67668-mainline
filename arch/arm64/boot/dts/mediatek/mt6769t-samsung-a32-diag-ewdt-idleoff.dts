@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: idle-strip / WFI-only (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Deltas: /delete-property/ cpu-idle-states on &cpu0..&cpu7
+ * (cpustrip idiom precedent:
+ * mt6769t-samsung-a32-diag-ewdt-cpustrip.dts:36-88). Removes all
+ * PSCI-suspend entry (CPU_SLEEP + CLUSTER_SLEEP references) while
+ * keeping every clock/OPP/CCI binding identical; idle falls back to
+ * plain WFI. Isolates whether the hang rides a PSCI CPU/cluster
+ * suspend path: if this image survives where the sink died, the
+ * idle/suspend layer was the fault.
+ *
+ * Distinct board identity below (board a32-ewdt-idleoff, 16 chars).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&cpu0 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu1 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu2 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu3 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu4 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu5 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu6 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu7 {
+	/delete-property/ cpu-idle-states;
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, idle-off)";
+	compatible = "samsung,a32-diag-ewdt-idleoff", "mediatek,mt6769t", "mediatek,mt6768";
+};

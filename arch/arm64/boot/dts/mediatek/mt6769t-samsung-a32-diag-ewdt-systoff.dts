@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: systimer-disable (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + delta.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Delta: &systimer (timer@10017000, "mediatek,mt6768-timer" +
+ * "mediatek,mt6765-timer") disabled. Kills the top suspect's live
+ * MMIO+IRQ+clocksource binding; &apxgpt + arm_arch_timer untouched.
+ * Isolates whether the hang rides the sys_timer path: if this image
+ * survives where the sink died, systimer was the fault layer.
+ *
+ * Distinct board identity below (board a32-ewdt-systoff, 16 chars).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&systimer {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, systimer-off)";
+	compatible = "samsung,a32-diag-ewdt-systoff", "mediatek,mt6769t", "mediatek,mt6768";
+};
