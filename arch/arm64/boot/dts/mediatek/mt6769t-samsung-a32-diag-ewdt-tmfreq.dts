@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: arch-timer clock-frequency add (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + delta.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Delta: root-merge clock-frequency <0xc65d40> (13 MHz, pmOS value,
+ * verified byte-read from references/PMOS-WORKINGBUILD/pmos-a32-heimdall/
+ * dtbs/mt6768.dtb /timer clock-frequency = c65d40) into the root
+ * arch-timer node. Node name/path verified in the minimal DT closure:
+ * mt6768.dtsi root node `timer` (compatible "arm,armv8-timer", no label,
+ * carries no clock-frequency in-tree, so this merge ADDS the property;
+ * interrupts/compatible untouched). Rationale: if LK/ATF leaves
+ * CNTFRQ_EL0 unset, the 6.18 timebase is dead; pmOS carries its own
+ * frequency. If this image survives where sink2 died, the missing
+ * timebase was the fault layer.
+ *
+ * Distinct board identity below (board a32-ewdt-tmfreq, 15 chars).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/ {
+	timer {
+		clock-frequency = <0xc65d40>;
+	};
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, timer-freq)";
+	compatible = "samsung,a32-diag-ewdt-tmfreq", "mediatek,mt6769t", "mediatek,mt6768";
+};

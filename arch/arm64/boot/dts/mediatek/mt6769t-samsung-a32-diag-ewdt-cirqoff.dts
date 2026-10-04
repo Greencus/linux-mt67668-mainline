@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: cirq-disable (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + delta.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Delta: &cirq (interrupt-controller@10204000, "mediatek,mt6768-cirq" +
+ * "mediatek,mtk-cirq") disabled. Label verified at mt6768.dtsi:1244
+ * (`cirq: interrupt-controller@10204000`, under /soc). Rationale:
+ * mainline-only live interrupt controller for SPIs; pmOS `sys_cirq`
+ * binds nothing. If this image survives where sink2 died, cirq was
+ * the fault layer.
+ *
+ * Distinct board identity below (board a32-ewdt-cirqoff, 16 chars,
+ * same width as the a32-ewdt-systoff precedent).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&cirq {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, cirq-off)";
+	compatible = "samsung,a32-diag-ewdt-cirqoff", "mediatek,mt6769t", "mediatek,mt6768";
+};
