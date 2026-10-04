@@ -1094,9 +1094,10 @@
 						reg = <MT6768_POWER_DOMAIN_VENC>;
 						#power-domain-cells = <0>;
 
-						clocks = <&vencsys CLK_VENC_SET1_VENC>,
+						clocks = <&vencsys CLK_VENC_SET0_LARB>,
+							 <&vencsys CLK_VENC_SET1_VENC>,
 							 <&vencsys CLK_VENC_SET2_JPGENC>;
-						clock-names = "vcodec-0", "vcodec-1"; // TODO: names
+						clock-names = "vcodec-0", "vcodec-1", "vcodec-2"; // TODO: names
 
 						mediatek,infracfg = <&infracfg_ao>;
 						mediatek,smi = <&smi_common>;
@@ -1185,7 +1186,7 @@
 			reg = <0 0x10238000 0 0x4000>;
 			interrupts = <GIC_SPI 170 IRQ_TYPE_LEVEL_LOW>;
 			#mbox-cells = <2>;
-			clocks = <&infracfg_ao CLK_INFRA_GCE>, <&infracfg_ao CLK_INFRA_GCE_26M>;
+			clocks = <&infracfg_ao CLK_INFRA_GCE>;
 			clock-names = "gce";
 		};
 
@@ -1869,7 +1870,6 @@
 			reg = <0 0x14001000 0 0x1000>;
 			interrupts = <GIC_SPI 223 IRQ_TYPE_LEVEL_LOW>;
 			power-domains = <&spm MT6768_POWER_DOMAIN_DISP>;
-			clocks = <&topckgen CLK_TOP_DISP_PWM_SEL>;
 			mediatek,gce-events = <CMDQ_EVENT_MUTEX0_STREAM_EOF>,
 					      <CMDQ_EVENT_MUTEX1_STREAM_EOF>;
 			mediatek,gce-client-reg = <&gce SUBSYS_1400XXXX 0x1000 0x1000>;
@@ -1920,7 +1920,7 @@
 			reg = <0 0x17010000 0 0x1000>;
 			mediatek,smi = <&smi_common>;
 			clocks = <&mmsys CLK_MM_SMI_VENC>,
-				 <&vencsys CLK_VENC_SET1_VENC>,
+				 <&vencsys CLK_VENC_SET0_LARB>,
 				 <&vencsys CLK_VENC_SET2_JPGENC>;
 			clock-names = "apb", "smi", "gals";
 			power-domains = <&spm MT6768_POWER_DOMAIN_VENC>;
