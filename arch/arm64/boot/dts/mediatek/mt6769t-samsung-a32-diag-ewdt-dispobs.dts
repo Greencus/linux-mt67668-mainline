@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: display-observability (ewdt-stop lane, DIAGNOSTIC ONLY).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane.
+ *
+ * Deltas (ATOMIC display set — enabled together, never split):
+ *   mmsys, smi_common, larb0, iommu, gce, mipi_tx0,
+ *   dsi0, ovl0, ovl_2l0, rdma0, mutex -> status = "okay".
+ * All phys / power-domains / clocks / mboxes / gce-client-reg / iommus
+ * references are the UNTOUCHED mainline values (the minimal DT only
+ * flipped status to disabled; it never deleted a ref property), so
+ * enabling restores the full atomic set in one step. wdma0/color0/
+ * ccorr0/aal0/gamma0/dither0/pwm stay disabled (minimal observability
+ * slice, not a full pipeline bring-up).
+ *
+ * NOTE: neither display pipeline binds on 6.18 (known: ov/rdma/dsi
+ * probe against mainline mt6768 strings stays unbound without the
+ * panel + full dispsys consumer chain). This graft is OBSERVABILITY
+ * ONLY: it exposes whether merely instantiating the display power
+ * domain + clocks + GCE mailbox moves the hang signature (e.g. a
+ * hang that disappears when DISP power is on points at the scpsys/
+ * DISP domain handshake, not at the watchdog or RAM contract).
+ *
+ * Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&mmsys {
+	status = "okay";
+};
+&smi_common {
+	status = "okay";
+};
+&larb0 {
+	status = "okay";
+};
+&iommu {
+	status = "okay";
+};
+&gce {
+	status = "okay";
+};
+&mipi_tx0 {
+	status = "okay";
+};
+&dsi0 {
+	status = "okay";
+};
+&ovl0 {
+	status = "okay";
+};
+&ovl_2l0 {
+	status = "okay";
+};
+&rdma0 {
+	status = "okay";
+};
+&mutex {
+	status = "okay";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, display-observability)";
+	compatible = "samsung,a32-diag-ewdt-dispobs", "mediatek,mt6769t", "mediatek,mt6768";
+};

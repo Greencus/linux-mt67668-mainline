@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft F: watchdog-disable (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + delta.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane.
+ *
+ * Delta: &toprgu { status = "disabled"; } ON TOP of the setup_arch-level
+ * neutralization (A32-EARLY-WDT STOP + TIMEOUT=0 paths compiled into
+ * Image-ewdt-stop.gz, which pre-stops TOPRGU at 0x10007000 before any
+ * initcall). The DT disable removes the mtk-wdt driver bind (no probe,
+ * no /dev/watchdog, no pet surface); the early quiesce still runs
+ * (it does not depend on the DT node — it uses early_ioremap of the
+ * fixed address). Together they test expiry-vs-hang with the driver
+ * GONE but TOPRGU hardware pre-stopped: if the board still resets at
+ * ~30 s, the reset is not the TOPRGU WDT path.
+ *
+ * Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&toprgu {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, watchdog-disable)";
+	compatible = "samsung,a32-diag-ewdt-wdtdis", "mediatek,mt6769t", "mediatek,mt6768";
+};

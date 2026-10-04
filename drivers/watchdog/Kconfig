@@ -938,6 +938,25 @@ config A32_EARLY_WDT_DIAG
 	  Say N. Enabled solely by the Diagnostic-3 fragment into a
 	  throwaway O directory; never in production configs.
 
+config A32_EARLY_WDT_TIMEOUT
+	int "A32 early WDT timeout seconds (DIAGNOSTIC ONLY, 0=stop)"
+	depends on A32_EARLY_WDT_DIAG
+	default 0
+	range 0 31
+	help
+	  Diagnostic-only: seconds for the setup_arch-level TOPRGU WDT
+	  neutralization (arch/arm64/kernel/setup.c calling into
+	  drivers/watchdog/mtk_wdt_a32_early.c).
+	  0 = STOP (downstream-proven keyed MODE write clearing EN).
+	  N > 0 = extend WDT_LENGTH to N seconds using the
+	  downstream-proven LENGTH encoding (ticks = N * 64, clamp
+	  0x7FF, LENGTH = (ticks << 5) | 0x8, mirroring
+	  mtk_wdt_set_timeout); MODE is left untouched and no
+	  reset/status/scratch register is written. Driver-valid
+	  window is 2..31 s (WDT_MIN_TIMEOUT..WDT_MAX_TIMEOUT).
+	  Say 0. Set solely via throwaway-O-dir fragments; never in
+	  production configs.
+
 config DIGICOLOR_WATCHDOG
 	tristate "Conexant Digicolor SoCs watchdog support"
 	depends on ARCH_DIGICOLOR || COMPILE_TEST

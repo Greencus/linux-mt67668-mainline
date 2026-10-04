@@ -56,6 +56,10 @@
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
 
+#ifdef CONFIG_A32_EARLY_WDT_DIAG
+extern void a32_early_wdt_setup_arch_quiesce(void);
+#endif
+
 static int num_standard_resources;
 static struct resource *standard_resources;
 
@@ -293,6 +297,21 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	early_ioremap_init();
 
 	setup_machine_fdt(__fdt_pointer);
+
+#ifdef CONFIG_A32_EARLY_WDT_DIAG
+	/* A32 diag: setup_arch-level TOPRGU WDT neutralization (DIAGNOSTIC
+	 * ONLY). Order-proof: setup_arch() is the earliest C code
+	 * (start_kernel -> setup_arch, long before do_initcalls, so strictly
+	 * before the early_initcall fallback in mtk_wdt_a32_early.c and long
+	 * before the mtk-wdt probe). Placement is after setup_machine_fdt()
+	 * because early_ioremap_init() (above) must precede early_ioremap(),
+	 * while OF/of_iomap is still unusable (unflatten_device_tree() runs
+	 * below); hence the helper maps fixed 0x10007000 via early_ioremap.
+	 * No conflict with the fallback: STOP's keyed EN-clear is
+	 * idempotent. Released via early_iounmap() before
+	 * early_ioremap_reset() below. */
+	a32_early_wdt_setup_arch_quiesce();
+#endif
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the

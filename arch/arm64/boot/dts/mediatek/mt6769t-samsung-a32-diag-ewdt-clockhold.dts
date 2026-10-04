@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft D: clock-hold (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane.
+ *
+ * Deltas (WHOLE clock block, atomic — all five nodes together, never
+ * split; GIC never grafted):
+ *   MAIN compatible -> pmOS generic string, address (reg) untouched:
+ *     topckgen:     "mediatek,mt6768-topckgen", "syscon"
+ *                -> "mediatek,topckgen", "syscon"
+ *     infracfg_ao:  "mediatek,mt6768-infracfg_ao", "syscon"
+ *                -> "mediatek,infracfg_ao", "syscon" (+ drop #reset-cells)
+ *     pericfg:     "mediatek,mt6768-pericfg", "syscon"
+ *                -> "mediatek,pericfg", "syscon"
+ *     apmixed:     "mediatek,mt6768-apmixedsys", "syscon"
+ *                -> "mediatek,apmixed", "syscon"
+ *     mcucfg:       "mediatek,mt6768-mcucfg", "syscon"
+ *                -> "mediatek,mcucfg"
+ *   #reset-cells: dropped on infracfg_ao ONLY (the single #reset-cells
+ *   addition mainline carries that pmOS lacks). #clock-cells kept
+ *   everywhere (pmOS keeps it on the four syscon clocks). Fixed-clocks
+ *   (clk26m/dummy13m/clk32k) and all clock consumers kept UNTOUCHED —
+ *   they are part of the atomic block by inclusion (no churn), not by
+ *   edit.
+ *
+ * Effect: clock drivers that match the mt6768-* strings no longer bind;
+ * only generic-syscon (or nothing) claims these blocks, holding the
+ * clock tree at bootloader rates (observability: clk_ignore_unused +
+ * pre-stopped WDT isolate the hang read-out).
+ *
+ * Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&topckgen {
+	compatible = "mediatek,topckgen", "syscon";
+};
+&infracfg_ao {
+	compatible = "mediatek,infracfg_ao", "syscon";
+	/delete-property/ #reset-cells;
+};
+&pericfg {
+	compatible = "mediatek,pericfg", "syscon";
+};
+&apmixed {
+	compatible = "mediatek,apmixed", "syscon";
+};
+&mcucfg {
+	compatible = "mediatek,mcucfg";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, clock-hold)";
+	compatible = "samsung,a32-diag-ewdt-clockhold", "mediatek,mt6769t", "mediatek,mt6768";
+};

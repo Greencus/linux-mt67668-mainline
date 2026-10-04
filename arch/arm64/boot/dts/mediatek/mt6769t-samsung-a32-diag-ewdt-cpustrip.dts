@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft C: cpu-strip (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane.
+ *
+ * Deltas: remove the synchronized clk_get surface from all 8 CPUs:
+ *   /delete-property/ clocks; /delete-property/ clock-names (where
+ *   present via the clocks pair); /delete-property/ operating-points-v2;
+ *   /delete-property/ mediatek,cci — on cpu0..cpu7, plus clocks +
+ *   operating-points-v2 on the &cci node itself.
+ *
+ * NOTE on static clock-frequency: NOT added (deletion suffices). The
+ * pmOS DTB carries static clock-frequency on each cpu (no clocks/OPP),
+ * but for this graft the diagnostic question is whether removing the
+ * cpufreq/cci clk_get bindings changes the hang signature. Deleting the
+ * three properties removes every sync clk_get + OPP + CCI reference the
+ * cpufreq/mediatek-cci drivers bind on, so no driver can attach a sync
+ * clock to the CPUs. Adding a static clock-frequency value is not
+ * required for that (it would only give the generic clock layer a fixed
+ * rate to report). Documented as intended, not an omission.
+ *
+ * OPP tables (cluster0/cluster1/cci) and mcucfg/l2/l3 nodes are KEPT
+ * but now unreferenced (orphan tables probe to no consumer). The atomic
+ * group (cpus+mcucfg+opp+cci+l3) is therefore split ONLY on the consumer
+ * side; provider nodes are untouched so a later graft can re-attach them
+ * without address churn. GIC never grafted (kept mainline).
+ *
+ * Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&cpu0 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu1 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu2 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu3 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu4 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu5 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu6 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu7 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cci {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, cpu-strip)";
+	compatible = "samsung,a32-diag-ewdt-cpustrip", "mediatek,mt6769t", "mediatek,mt6768";
+};

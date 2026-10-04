@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft: single-GPT (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + delta.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane.
+ *
+ * Delta: disable the legacy GPT block timer@10008000 (&apxgpt,
+ * "mediatek,mt6795-timer" + "mediatek,mt6577-timer") and KEEP
+ * timer@10017000 (&systimer, "mediatek,mt6768-timer" +
+ * "mediatek,mt6765-timer") enabled. Isolates which GPT the
+ * clocksource/clockevent layer binds: if the hang moves with only the
+ * sys_timer present, the apxgpt path is implicated (and vice versa).
+ * sched_clock + arm_arch_timer (separate `timer` node) untouched.
+ *
+ * Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+&apxgpt {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, single-gpt)";
+	compatible = "samsung,a32-diag-ewdt-gpt1", "mediatek,mt6769t", "mediatek,mt6768";
+};
