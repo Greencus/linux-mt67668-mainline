@@ -1,0 +1,447 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft S2: kitchen-sink2 / remainder combo (ewdt-stop lane,
+ * sink + ALL remainder singles TOGETHER).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Rationale: sink (6 grafts) + systoff + idleoff + gicflat each die
+ * ~30 s alone; the three remainder singles were built on MINIMAL, not
+ * on sink — this image tests them ALL TOGETHER. It does NOT
+ * nest-include variant files (double-minimal risk): it #includes the
+ * minimal DT once and repeats each delta block below, with source file
+ * + line citations.
+ *
+ * Combined groups (disjoint nodes/props — no overlapping edits):
+ *   S1 chosenmem (mt6769t-samsung-a32-diag-ewdt-sink.dts:52-58,
+ *      61-133; from mt6769t-samsung-a32-diag-ewdt-chosenmem.dts:33-40,
+ *      42-115): pmOS memory@40000000 reg
+ *      <0x0 0x40000000 0x0 0x3e605000> + 14-node vendor reserved-memory
+ *      set; ramoops@4d010000 + ram_console@4d000000 KEPT per the
+ *      no-overlap audit (chosenmem.dts:15-23). chosen NOT touched.
+ *   S2 cpustrip (sink.dts:136-188; from
+ *      mt6769t-samsung-a32-diag-ewdt-cpustrip.dts:36-88):
+ *      /delete-property/ clocks/clock-names/operating-points-v2/
+ *      mediatek,cci on cpu0..cpu7 + clocks/clock-names/
+ *      operating-points-v2 on &cci. OPP/mcucfg/l2/l3 KEPT orphaned.
+ *   S3 clockhold (sink.dts:191-206; from
+ *      mt6769t-samsung-a32-diag-ewdt-clockhold.dts:39-54):
+ *      5 generic compatible swaps (topckgen/infracfg_ao/pericfg/apmixed/
+ *      mcucfg) + #reset-cells drop on infracfg_ao only.
+ *   S4 nopmic (sink.dts:208-348; from
+ *      mt6769t-samsung-a32-diag-nopmic.dts:48-186): status
+ *      disabled on all 26 suppressible MT6358 rails (dependency basis
+ *      nopmic.dts:19-41); 14 always-on rails untouched.
+ *   S5 wdtdis (sink.dts:351-353; from
+ *      mt6769t-samsung-a32-diag-ewdt-wdtdis.dts:24-26):
+ *      &toprgu disabled (early-quiesce still runs; driver bind gone).
+ *   S6 gpt1 (sink.dts:356-358; from
+ *      mt6769t-samsung-a32-diag-ewdt-gpt1.dts:22-24): &apxgpt
+ *      disabled, arm_arch_timer untouched (&systimer handled by R1).
+ *   R1 systoff (mt6769t-samsung-a32-diag-ewdt-systoff.dts:22-24):
+ *      &systimer disabled; &apxgpt (S6) + arm_arch_timer untouched.
+ *   R2 idleoff (mt6769t-samsung-a32-diag-ewdt-idleoff.dts:25-48):
+ *      /delete-property/ cpu-idle-states on &cpu0..&cpu7 (WFI-only;
+ *      PSCI-suspend references gone, clocks/OPP/CCI bindings identical).
+ *   R3 gicflat (mt6769t-samsung-a32-diag-ewdt-gicflat.dts:31-50):
+ *      &gic { /delete-node/ ppi-partitions; #interrupt-cells = <3>;
+ *      3-cell maintenance IRQ } + root timer/pmu-a55/pmu-a75 3-cell PPI
+ *      trims. The GIC node itself STAYS (never removed).
+ *   R4 scpsys (mt6769t-samsung-a32-diag-ewdt-scpsys.dts:51-58):
+ *      &scpsys + &spm (power-controller child) disabled, atomic pair.
+ *
+ * Each variant's own &{/} board-identity block is NOT repeated (a single
+ * sink2 identity is used instead: see bottom).
+ *
+ * GIC node itself stays (never remove the interrupt controller).
+ *
+ * Read-out contract: if this image survives physically, the killer was
+ * interaction across the remainder layers (systimer/idle/GIC/scpsys on
+ * top of the sink base) — bisect DOWNWARD from sink2 by subtracting
+ * remainder groups. If it dies, the DT side is essentially exhausted
+ * and the residue is kernel-core/arch or pre-setup_arch (before the
+ * setup_arch early-WDT quiesce / device-tree unflatten point).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* S1: chosenmem block (chosenmem.dts:33-40: pmOS RAM contract). */
+&{/} {
+	/delete-node/ memory@40000000;
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x3e605000>; /* pmOS: ~998 MiB, top 0x7E605000 */
+	};
+};
+
+/* S1: chosenmem block (chosenmem.dts:42-115: pmOS 14-node vendor set). */
+&{/reserved-memory} {
+	sec-log-reserve-memory@0x46C00000 {
+		reg = <0x00 0x46c00000 0x00 0x200000>;
+	};
+	sec-lastklog@0x46E00000 {
+		reg = <0x00 0x46e00000 0x00 0x200000>;
+	};
+	sec-logger-reserve-memory@0x47000000 {
+		reg = <0x00 0x47000000 0x00 0x400000>;
+	};
+	sec-autocomment-reserve-memory@0x47400000 {
+		reg = <0x00 0x47400000 0x00 0x10000>;
+	};
+	sec-extrainfo-reserve-memory@0x47410000 {
+		reg = <0x00 0x47410000 0x00 0x1f0000>;
+	};
+	sec-initlog-reserve-memory@0x47600000 {
+		reg = <0x00 0x47600000 0x00 0x200000>;
+	};
+	reserve-memory-ssmr {
+		compatible = "mediatek,reserve-memory-ssmr";
+		no-map;
+		size = <0x00 0x1000>;
+		alignment = <0x00 0x1000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	zmc-default {
+		compatible = "mediatek,zone_movable_cma";
+		size = <0x00 0x40000000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	cccimdee-reserved-memory@0x4AE3E000 {
+		compatible = "mediatek,ccci-md-ee-dump";
+		reg = <0x00 0x4ae3e000 0x00 0x1c2000>;
+	};
+	reserve-memory-sspm_share {
+		compatible = "mediatek,reserve-memory-sspm_share";
+		no-map;
+		status = "okay";
+		size = <0x00 0x510000>;
+		alignment = <0x00 0x10000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x60000000>;
+	};
+	reserve-memory-scp_share {
+		compatible = "mediatek,reserve-memory-scp_share";
+		no-map;
+		size = <0x00 0x300000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x50000000>;
+	};
+	ion-carveout-heap {
+		compatible = "mediatek,ion-carveout-heap";
+		no-map;
+		size = <0x00 0x9000>;
+		alignment = <0x00 0x1000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	consys-reserve-memory {
+		compatible = "mediatek,consys-reserve-memory";
+		no-map;
+		size = <0x00 0x440000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x80000000>;
+	};
+	wifi-reserve-memory {
+		compatible = "shared-dma-pool";
+		no-map;
+		size = <0x00 0x300000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x80000000>;
+	};
+};
+
+/* S2: cpustrip block (cpustrip.dts:36-88: strip sync clk_get surface). */
+&cpu0 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu1 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu2 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu3 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu4 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu5 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu6 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu7 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cci {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+};
+
+/* S3: clockhold block (clockhold.dts:39-54: generic compat hold). */
+&topckgen {
+	compatible = "mediatek,topckgen", "syscon";
+};
+&infracfg_ao {
+	compatible = "mediatek,infracfg_ao", "syscon";
+	/delete-property/ #reset-cells;
+};
+&pericfg {
+	compatible = "mediatek,pericfg", "syscon";
+};
+&apmixed {
+	compatible = "mediatek,apmixed", "syscon";
+};
+&mcucfg {
+	compatible = "mediatek,mcucfg";
+};
+
+/* S4: nopmic block (nopmic.dts:48-186: 26 suppressible rails off). */
+/* vpa | buck_vpa | modem RF PA buck | modem/CCCI absent by construction
+ * (ccci fragment not included; no modem node in closure) | disabled. */
+&mt6358_vpa_reg {
+	status = "disabled";
+};
+
+/* vgpu | buck_vgpu | gpu mali-supply + domain-supply, board-only
+ * (a32.dts:245,274, not included) | &gpu disabled in minimal | disabled. */
+&mt6358_vgpu_reg {
+	status = "disabled";
+};
+
+/* vsram_gpu | ldo_vsram_gpu | gpu coupled pair + domain-supply,
+ * board-only (a32.dts:257-269, not included) | &gpu disabled | disabled. */
+&mt6358_vsram_gpu_reg {
+	status = "disabled";
+};
+
+/* vdram2 | ldo_vdram2 | board always-on override only (a32.dts:54-55,
+ * not included); memory@40000000 carries no supply; DRAM retention stays
+ * on vdram1 (always-on, untouched) | no DIAG consumer | disabled. */
+&mt6358_vdram2_reg {
+	status = "disabled";
+};
+
+/* vsim1 | ldo_vsim1 | SIM | no SIM/UIM node anywhere in closure | disabled. */
+&mt6358_vsim1_reg {
+	status = "disabled";
+};
+
+/* vsim2 | ldo_vsim2 | SIM2 | no SIM/UIM node anywhere in closure | disabled. */
+&mt6358_vsim2_reg {
+	status = "disabled";
+};
+
+/* vibr | ldo_vibr | vibrator | no vibrator node in closure | disabled. */
+&mt6358_vibr_reg {
+	status = "disabled";
+};
+
+/* vrf12 | ldo_vrf12 | modem RF | modem/CCCI absent by construction | disabled. */
+&mt6358_vrf12_reg {
+	status = "disabled";
+};
+
+/* vrf18 | ldo_vrf18 | modem RF | modem/CCCI absent by construction | disabled. */
+&mt6358_vrf18_reg {
+	status = "disabled";
+};
+
+/* vcamio | ldo_vcamio | camera IO | &camsys + &imgsys disabled in minimal | disabled. */
+&mt6358_vcamio_reg {
+	status = "disabled";
+};
+
+/* vcamd | ldo_vcamd | camera digital | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcamd_reg {
+	status = "disabled";
+};
+
+/* vcama1 | ldo_vcama1 | camera analog | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcama1_reg {
+	status = "disabled";
+};
+
+/* vcama2 | ldo_vcama2 | camera analog2 | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcama2_reg {
+	status = "disabled";
+};
+
+/* vcn18 | ldo_vcn18 | BT vcn18-supply, board-only (a32.dts:617) |
+ * bluetooth-a32 absent by construction | disabled. */
+&mt6358_vcn18_reg {
+	status = "disabled";
+};
+
+/* vcn28 | ldo_vcn28 | BT vcn28-supply, board-only (a32.dts:618) |
+ * bluetooth-a32 absent by construction | disabled. */
+&mt6358_vcn28_reg {
+	status = "disabled";
+};
+
+/* vcn33 | ldo_vcn33 | BT+WiFi shared, board-only (a32.dts:619-620) |
+ * BT absent; WiFi module-driven with no DT node | disabled. */
+&mt6358_vcn33_reg {
+	status = "disabled";
+};
+
+/* vfe28 | ldo_vfe28 | analog frontend | no consumer node in closure | disabled. */
+&mt6358_vfe28_reg {
+	status = "disabled";
+};
+
+/* vaux18 | ldo_vaux18 | aux IO | no consumer (&auxadc disabled) | disabled. */
+&mt6358_vaux18_reg {
+	status = "disabled";
+};
+
+/* vbif28 | ldo_vbif28 | battery interface | no BIF consumer node | disabled. */
+&mt6358_vbif28_reg {
+	status = "disabled";
+};
+
+/* vio28 | ldo_vio28 | general 2.8V IO | zero -supply refs in closure | disabled. */
+&mt6358_vio28_reg {
+	status = "disabled";
+};
+
+/* vaud28 | ldo_vaud28 | audio | mt6358codec has no *-supply props;
+ * mt6768.dtsi has zero -supply props, so AFE/codec cannot bind it | disabled. */
+&mt6358_vaud28_reg {
+	status = "disabled";
+};
+
+/* vldo28 | ldo_vldo28 | general LDO | zero -supply refs in closure | disabled. */
+&mt6358_vldo28_reg {
+	status = "disabled";
+};
+
+/* vefuse | ldo_vefuse | eFuse programming | efuse nodes carry no supplies;
+ * OTP rail unneeded at runtime boot | disabled. */
+&mt6358_vefuse_reg {
+	status = "disabled";
+};
+
+/* vmch | ldo_vmch | SD/eMMC HV | &mmc0 + &mmc1 disabled in minimal | disabled. */
+&mt6358_vmch_reg {
+	status = "disabled";
+};
+
+/* vemc | ldo_vemc | mmc0 vmmc-supply, board-only (a32.dts:168) |
+ * &mmc0 disabled in minimal | disabled. */
+&mt6358_vemc_reg {
+	status = "disabled";
+};
+
+/* vmc | ldo_vmc | MMC IO | &mmc0 + &mmc1 disabled in minimal | disabled. */
+&mt6358_vmc_reg {
+	status = "disabled";
+};
+
+/* S5: wdtdis block (wdtdis.dts:24-26: driver bind gone, hw pre-stopped). */
+&toprgu {
+	status = "disabled";
+};
+
+/* S6: gpt1 block (gpt1.dts:22-24: apxgpt off, systimer kept for R1). */
+&apxgpt {
+	status = "disabled";
+};
+
+/* R1: systoff block (systoff.dts:22-24: sys_timer path inert). */
+&systimer {
+	status = "disabled";
+};
+
+/* R2: idleoff block (idleoff.dts:25-48: WFI-only, PSCI suspend gone). */
+&cpu0 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu1 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu2 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu3 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu4 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu5 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu6 {
+	/delete-property/ cpu-idle-states;
+};
+&cpu7 {
+	/delete-property/ cpu-idle-states;
+};
+
+/* R3: gicflat block (gicflat.dts:31-35: departition, 3-cell). */
+&gic {
+	#interrupt-cells = <3>;
+	interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+	/delete-node/ ppi-partitions;
+};
+
+/* R3: gicflat block (gicflat.dts:37-50: timer/PMU PPI 3-cell trims). */
+/ {
+	timer {
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW>;
+	};
+	pmu-a55 {
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+	};
+	pmu-a75 {
+		interrupts = <GIC_PPI 7 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/* R4: scpsys block (scpsys.dts:51-58: atomic parent+child bypass). */
+&scpsys {
+	status = "disabled";
+};
+&spm {
+	status = "disabled";
+};
+
+/* Distinct board identity (single sink2 override; per-variant blocks not repeated). */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, kitchen-sink2)";
+	compatible = "samsung,a32-diag-ewdt-sink2", "mediatek,mt6769t", "mediatek,mt6768";
+};
