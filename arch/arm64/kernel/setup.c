@@ -6,6 +6,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/a32_boot_mark.h>
 #include <linux/acpi.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
@@ -280,6 +281,8 @@ u64 cpu_logical_map(unsigned int cpu)
 
 void __init __no_sanitize_address setup_arch(char **cmdline_p)
 {
+	/* A32 diag K0: earliest C entry; printk-only, logbuf-buffered. */
+	a32_boot_mark(0, "setup_arch entered (earliest kernel C entry)");
 	setup_initial_init_mm(_text, _etext, _edata, _end);
 
 	*cmdline_p = boot_command_line;

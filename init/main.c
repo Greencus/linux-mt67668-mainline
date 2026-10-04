@@ -28,6 +28,7 @@
 #include <linux/init.h>
 #include <linux/initrd.h>
 #include <linux/memblock.h>
+#include <linux/a32_boot_mark.h>
 #include <linux/acpi.h>
 #include <linux/bootconfig.h>
 #include <linux/console.h>
@@ -1022,6 +1023,8 @@ void start_kernel(void)
 	softirq_init();
 	timekeeping_init();
 	time_init();
+	/* A32 diag K1: GIC (init_IRQ) + early clocks + arch timer done. */
+	a32_boot_mark(1, "GIC/timer setup complete (init_IRQ+time_init returned)");
 
 	/* This must be after timekeeping is initialized */
 	random_init();
@@ -1373,6 +1376,8 @@ static void __init do_initcalls(void)
  */
 static void __init do_basic_setup(void)
 {
+	/* A32 diag K2: driver initcall phase reached (clocks/resets/power next). */
+	a32_boot_mark(2, "do_basic_setup entered, clock/reset/power initcalls next");
 	cpuset_init_smp();
 	driver_init();
 	init_irq_proc();
@@ -1507,6 +1512,8 @@ static int __ref kernel_init(void *unused)
 
 	do_sysctl_args();
 
+	/* A32 diag K5: late-init done, unconditional; /init handoff next. */
+	a32_boot_mark(5, "late-init done, trying /init handoff");
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
@@ -1586,6 +1593,8 @@ static noinline void __init kernel_init_freeable(void)
 
 	smp_init();
 	sched_init_smp();
+	/* A32 diag K4: SMP bring-up done; marker only, SMP flow untouched. */
+	a32_boot_mark(4, "SMP bring-up complete (smp_init+sched_init_smp returned)");
 
 	workqueue_init_topology();
 	async_init();

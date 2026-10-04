@@ -61,6 +61,15 @@
 
 #define WDT_SWSYSRST_EN		0xfc
 
+/* TOPRGU reason/stage regs, diagnostic reads only. Corroborated by
+ * downstream wdt_v1/mtk_wdt.h (:22 STATUS, :26 NONRST, :27 NONRST2) and
+ * wdt_v2/mtk_wdt.h (:23 STATUS, :27 NONRST, :28 NONRST2), same TOPRGU
+ * block (MTK_WDT_BASE = toprgu_base); covered by mapped DT reg region.
+ */
+#define WDT_STATUS		0x0C
+#define WDT_NONRST		0x20
+#define WDT_NONRST2		0x24
+
 #define DRV_NAME		"mtk-wdt"
 #define DRV_VERSION		"1.0"
 
@@ -402,6 +411,7 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 	const struct mtk_wdt_data *wdt_data;
 	int err, irq;
 
+	pr_emerg("A32-WDT-DIAG: probe entry\n");
 	pr_info("A32-BREADCRUMB: wdt-probe-enter\n");
 
 	mtk_wdt = devm_kzalloc(dev, sizeof(*mtk_wdt), GFP_KERNEL);
@@ -413,6 +423,12 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 	mtk_wdt->wdt_base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(mtk_wdt->wdt_base))
 		return PTR_ERR(mtk_wdt->wdt_base);
+
+	pr_emerg("A32-WDT-DIAG: MODE=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_MODE));
+	pr_emerg("A32-WDT-DIAG: LENGTH=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_LENGTH));
+	pr_emerg("A32-WDT-DIAG: STATUS=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_STATUS));
+	pr_emerg("A32-WDT-DIAG: NONRST=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST));
+	pr_emerg("A32-WDT-DIAG: NONRST2=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST2));
 
 	irq = platform_get_irq_optional(pdev, 0);
 	if (irq > 0) {
@@ -444,6 +460,13 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 
 	mtk_wdt_init(&mtk_wdt->wdt_dev);
 
+	pr_emerg("A32-WDT-DIAG: after watchdog start\n");
+	pr_emerg("A32-WDT-DIAG: MODE=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_MODE));
+	pr_emerg("A32-WDT-DIAG: LENGTH=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_LENGTH));
+	pr_emerg("A32-WDT-DIAG: STATUS=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_STATUS));
+	pr_emerg("A32-WDT-DIAG: NONRST=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST));
+	pr_emerg("A32-WDT-DIAG: NONRST2=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST2));
+
 	watchdog_stop_on_reboot(&mtk_wdt->wdt_dev);
 	err = devm_watchdog_register_device(dev, &mtk_wdt->wdt_dev);
 	if (unlikely(err))
@@ -469,6 +492,13 @@ static int mtk_wdt_probe(struct platform_device *pdev)
 		of_property_read_bool(dev->of_node, "mediatek,reset-by-toprgu");
 
 	pr_info("A32-BREADCRUMB: wdt-probe-ok\n");
+
+	pr_emerg("A32-WDT-DIAG: probe done\n");
+	pr_emerg("A32-WDT-DIAG: MODE=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_MODE));
+	pr_emerg("A32-WDT-DIAG: LENGTH=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_LENGTH));
+	pr_emerg("A32-WDT-DIAG: STATUS=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_STATUS));
+	pr_emerg("A32-WDT-DIAG: NONRST=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST));
+	pr_emerg("A32-WDT-DIAG: NONRST2=0x%08x\n", readl(mtk_wdt->wdt_base + WDT_NONRST2));
 
 	return 0;
 }
