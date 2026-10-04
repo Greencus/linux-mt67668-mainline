@@ -104,6 +104,11 @@ static const struct mtk_fixed_factor top_divs[] = {
 	FACTOR(CLK_TOP_VENC, "venc_ck", "venc_sel", 1, 1),
 	FACTOR(CLK_TOP_CAM, "cam_ck", "cam_sel", 1, 1),
 	FACTOR(CLK_TOP_F_BIST2FPC, "f_bist2fpc_ck", "univpll2_d2", 1, 1),
+	FACTOR(CLK_TOP_ARMPLL_DIVIDER_PLL0, "arm_div_pll0", "syspll_d2", 1, 1),
+	FACTOR(CLK_TOP_ARMPLL_DIVIDER_PLL1, "arm_div_pll1", "syspll_ck", 1, 1),
+	FACTOR(CLK_TOP_ARMPLL_DIVIDER_PLL2, "arm_div_pll2", "univpll_d2", 1, 1),
+	FACTOR(CLK_TOP_DA_USB20_48M_DIV, "usb20_48m_div", "usb20_192m_d4", 1, 1),
+	FACTOR(CLK_TOP_DA_UNIV_48M_DIV, "univ_48m_div", "usb20_192m_d4", 1, 1),
 };
 
 static const char * const axi_parents[] = {
