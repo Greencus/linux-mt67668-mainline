@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft PAIR 2: cpustrip + nopmic (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… + 81 B cmdline).
+ * Do NOT nest-include the single variants: minimal is included ONCE here
+ * and both delta blocks below are repeated verbatim with source citations.
+ * GIC untouched. Clocks LIVE in this pair.
+ *
+ * Delta A — cpu-strip (source: mt6769t-samsung-a32-diag-ewdt-cpustrip.dts
+ * :36-88): 27 property deletes — clocks/clock-names/operating-points-v2/
+ * mediatek,cci on cpu0..cpu7, plus clocks/clock-names/operating-points-v2
+ * on &cci. OPP tables + mcucfg/l2/l3 kept as orphans.
+ *
+ * Delta B — nopmic (source: mt6769t-samsung-a32-diag-nopmic.dts :48-186):
+ * status = "disabled" on each of the 26 suppressible MT6358 regulator
+ * nodes; the 14 always-on rails (vdram1, vcore, vproc11/12, vs2, vmodem,
+ * vs1, vio18, vusb, vsram_proc11/others/proc12, vxo22, va12) NEVER touched.
+ * Dependency basis (see nopmic header): mt6768.dtsi carries zero -supply
+ * refs; every suppressible rail's consumer lives only in the board file,
+ * absent by construction in DIAG.
+ *
+ * SUBSUMPTION NOTE (belt-and-braces rationale): the clockhold single
+ * already subsumes nopmic in practice — generic clock compats defer the
+ * pwrap/PMIC probe path, so the PMIC is dormant under clockhold without
+ * touching any rail. This pair is still built deliberately: with clocks
+ * LIVE and CPU-sync + PMIC both out, it tests whether live clocks are OK
+ * once the CPU and PMIC surfaces are removed.
+ *
+ * Diagnostic question: CPU sync surface + PMIC dormant, clocks LIVE.
+ * Survives => the hang surface is the interaction of this pair (live
+ * clocks exonerated); dies => wider combo needed.
+ *
+ * Distinct board identity below (board a32-ewdt-cpunopmic).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* Pair delta A: cpu-strip, 27 deletes (cf. ewdt-cpustrip.dts :36-88). */
+&cpu0 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu1 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu2 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu3 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu4 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu5 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu6 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu7 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cci {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+};
+
+/* Pair delta B: 26 PMIC regulator disables (cf. nopmic.dts :48-186).
+ * Bucks: vpa (modem RF PA, CCCI absent). */
+&mt6358_vpa_reg {
+	status = "disabled";
+};
+
+/* vgpu (gpu mali-supply, board-only; &gpu disabled in minimal). */
+&mt6358_vgpu_reg {
+	status = "disabled";
+};
+
+/* LDOs: vsram_gpu (gpu coupled pair, board-only). */
+&mt6358_vsram_gpu_reg {
+	status = "disabled";
+};
+
+/* vdram2 (board always-on override only; retention stays on vdram1). */
+&mt6358_vdram2_reg {
+	status = "disabled";
+};
+
+/* vsim1/vsim2 (no SIM/UIM node in closure). */
+&mt6358_vsim1_reg {
+	status = "disabled";
+};
+&mt6358_vsim2_reg {
+	status = "disabled";
+};
+
+/* vibr (no vibrator node in closure). */
+&mt6358_vibr_reg {
+	status = "disabled";
+};
+
+/* vrf12/vrf18 (modem RF, CCCI absent). */
+&mt6358_vrf12_reg {
+	status = "disabled";
+};
+&mt6358_vrf18_reg {
+	status = "disabled";
+};
+
+/* vcamio/vcamd/vcama1/vcama2 (camsys+imgsys disabled in minimal). */
+&mt6358_vcamio_reg {
+	status = "disabled";
+};
+&mt6358_vcamd_reg {
+	status = "disabled";
+};
+&mt6358_vcama1_reg {
+	status = "disabled";
+};
+&mt6358_vcama2_reg {
+	status = "disabled";
+};
+
+/* vcn18/vcn28/vcn33 (BT supplies, board-only; BT absent). */
+&mt6358_vcn18_reg {
+	status = "disabled";
+};
+&mt6358_vcn28_reg {
+	status = "disabled";
+};
+&mt6358_vcn33_reg {
+	status = "disabled";
+};
+
+/* vfe28 (no consumer node). */
+&mt6358_vfe28_reg {
+	status = "disabled";
+};
+
+/* vaux18 (auxadc disabled). */
+&mt6358_vaux18_reg {
+	status = "disabled";
+};
+
+/* vbif28 (no BIF consumer). */
+&mt6358_vbif28_reg {
+	status = "disabled";
+};
+
+/* vio28 (zero -supply refs in closure). */
+&mt6358_vio28_reg {
+	status = "disabled";
+};
+
+/* vaud28 (codec has no *-supply props). */
+&mt6358_vaud28_reg {
+	status = "disabled";
+};
+
+/* vldo28 (zero -supply refs). */
+&mt6358_vldo28_reg {
+	status = "disabled";
+};
+
+/* vefuse (efuse nodes carry no supplies). */
+&mt6358_vefuse_reg {
+	status = "disabled";
+};
+
+/* vmch/vemc/vmc (mmc0+mmc1 disabled in minimal; vemc board-only). */
+&mt6358_vmch_reg {
+	status = "disabled";
+};
+&mt6358_vemc_reg {
+	status = "disabled";
+};
+&mt6358_vmc_reg {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, cpustrip+nopmic)";
+	compatible = "samsung,a32-diag-ewdt-cpunopmic", "mediatek,mt6769t", "mediatek,mt6768";
+};

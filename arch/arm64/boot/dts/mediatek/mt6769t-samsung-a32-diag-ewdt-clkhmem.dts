@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft PAIR 1: clockhold + chosenmem (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… + 81 B cmdline).
+ * Do NOT nest-include the single variants: minimal is included ONCE here
+ * and both delta blocks below are repeated verbatim with source citations.
+ * GIC untouched.
+ *
+ * Delta A — clock-hold (source: mt6769t-samsung-a32-diag-ewdt-clockhold.dts
+ * :39-54): whole clock block, atomic. MAIN compatible -> pmOS generic
+ * string, address (reg) untouched; #reset-cells dropped on infracfg_ao only.
+ * Effect: mt6768-* clock drivers no longer bind; tree held at bootloader
+ * rates.
+ *
+ * Delta B — chosen+mem (source:
+ * mt6769t-samsung-a32-diag-ewdt-chosenmem.dts): memory@40000000
+ * delete+replace with pmOS contract reg <0x0 0x40000000 0x0 0x3e605000>
+ * (~998 MiB, top 0x7E605000) + graft of the pmOS 14-node vendor
+ * reserved-memory set verbatim; mainline ramoops@4d010000 +
+ * ram_console@4d000000 kept (no static-reg overlap: sec-* end 0x47800000,
+ * cccimdee ends 0x4B000000, rest dynamic; see chosenmem header).
+ * chosen: NO DELTA (mainline stdout-path + clk_ignore_unused kept).
+ *
+ * Diagnostic question: clocks frozen + pmOS RAM/reserves. Survives =>
+ * the hang surface is the interaction of this pair; dies => wider combo
+ * needed.
+ *
+ * Distinct board identity below (board a32-ewdt-clkhmem).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* Pair delta A: clock-hold (cf. ewdt-clockhold.dts :39-54). */
+&topckgen {
+	compatible = "mediatek,topckgen", "syscon";
+};
+&infracfg_ao {
+	compatible = "mediatek,infracfg_ao", "syscon";
+	/delete-property/ #reset-cells;
+};
+&pericfg {
+	compatible = "mediatek,pericfg", "syscon";
+};
+&apmixed {
+	compatible = "mediatek,apmixed", "syscon";
+};
+&mcucfg {
+	compatible = "mediatek,mcucfg";
+};
+
+/* Pair delta B1: pmOS RAM contract (cf. ewdt-chosenmem.dts :33-40). */
+&{/} {
+	/delete-node/ memory@40000000;
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x3e605000>; /* pmOS: ~998 MiB, top 0x7E605000 */
+	};
+};
+
+/* Pair delta B2: pmOS 14-node vendor reserved-memory set, verbatim
+ * (cf. ewdt-chosenmem.dts :42-115). */
+&{/reserved-memory} {
+	sec-log-reserve-memory@0x46C00000 {
+		reg = <0x00 0x46c00000 0x00 0x200000>;
+	};
+	sec-lastklog@0x46E00000 {
+		reg = <0x00 0x46e00000 0x00 0x200000>;
+	};
+	sec-logger-reserve-memory@0x47000000 {
+		reg = <0x00 0x47000000 0x00 0x400000>;
+	};
+	sec-autocomment-reserve-memory@0x47400000 {
+		reg = <0x00 0x47400000 0x00 0x10000>;
+	};
+	sec-extrainfo-reserve-memory@0x47410000 {
+		reg = <0x00 0x47410000 0x00 0x1f0000>;
+	};
+	sec-initlog-reserve-memory@0x47600000 {
+		reg = <0x00 0x47600000 0x00 0x200000>;
+	};
+	reserve-memory-ssmr {
+		compatible = "mediatek,reserve-memory-ssmr";
+		no-map;
+		size = <0x00 0x1000>;
+		alignment = <0x00 0x1000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	zmc-default {
+		compatible = "mediatek,zone_movable_cma";
+		size = <0x00 0x40000000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	cccimdee-reserved-memory@0x4AE3E000 {
+		compatible = "mediatek,ccci-md-ee-dump";
+		reg = <0x00 0x4ae3e000 0x00 0x1c2000>;
+	};
+	reserve-memory-sspm_share {
+		compatible = "mediatek,reserve-memory-sspm_share";
+		no-map;
+		status = "okay";
+		size = <0x00 0x510000>;
+		alignment = <0x00 0x10000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x60000000>;
+	};
+	reserve-memory-scp_share {
+		compatible = "mediatek,reserve-memory-scp_share";
+		no-map;
+		size = <0x00 0x300000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x50000000>;
+	};
+	ion-carveout-heap {
+		compatible = "mediatek,ion-carveout-heap";
+		no-map;
+		size = <0x00 0x9000>;
+		alignment = <0x00 0x1000>;
+		alloc-ranges = <0x00 0xc0000000 0x04 0x00>;
+	};
+	consys-reserve-memory {
+		compatible = "mediatek,consys-reserve-memory";
+		no-map;
+		size = <0x00 0x440000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x80000000>;
+	};
+	wifi-reserve-memory {
+		compatible = "shared-dma-pool";
+		no-map;
+		size = <0x00 0x300000>;
+		alignment = <0x00 0x1000000>;
+		alloc-ranges = <0x00 0x40000000 0x00 0x80000000>;
+	};
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, clockhold+chosenmem)";
+	compatible = "samsung,a32-diag-ewdt-clkhmem", "mediatek,mt6769t", "mediatek,mt6768";
+};

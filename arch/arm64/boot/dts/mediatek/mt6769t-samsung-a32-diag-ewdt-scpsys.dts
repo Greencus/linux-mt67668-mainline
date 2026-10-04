@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft H: scpsys-bypass (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… 1447621 B
+ * + 81 B cmdline + scripts/build-bootimg.sh pinned geometry).
+ *
+ * Rationale: the missing single. Prior single grafts (chosenmem,
+ * cpustrip, clockhold, nopmic, wdtdis, gpt1, dispobs) each isolate one
+ * subsystem and none reproduced the pmOS-DTB survival signature, so the
+ * hang plausibly needs multiple subsystems inert at once — but the
+ * scpsys power-controller single was never built. This graft closes
+ * that gap before the kitchen-sink combination.
+ *
+ * Deltas (ATOMIC scpsys pair — parent + child together, never split):
+ *   1. &scpsys (clock-controller@10006000, "mediatek,mt6768-scpsys",
+ *      "syscon", "simple-mfd", mt6768.dtsi:1021-1023) -> disabled.
+ *   2. &spm (power-controller child, "mediatek,mt6768-power-controller",
+ *      mt6768.dtsi:1025-1030) -> disabled EXPLICITLY (a disabled parent
+ *      MFD would already suppress the child probe; the explicit child
+ *      disable makes the intent auditable and survives any future
+ *      parent/child decoupling).
+ *
+ * Expected inertness:
+ *   - mtk-pm-domains ("mediatek,mt6768-power-controller") never probes,
+ *     so NO pm_genpd providers register for MD1/CONN/DPY/DISP(+ISP/CAM/
+ *     VENC/VDEC children)/IFR/MFG_ASYNC/MFG/MFG_CORE0/MFG_CORE1.
+ *   - The scpsys syscon ("mediatek,mt6768-scpsys") never registers, so no
+ *     driver can map 0x10006000 through the syscon handle.
+ *   - All DIAG power-domain consumers are ALREADY disabled in the minimal
+ *     DT, so nothing should -EPROBE_DEFER on the missing domains:
+ *     mmsys, smi_common, mfgcfg, gpu, pwm0, dsi0, larb0/1/2/3/4, ovl0,
+ *     ovl_2l0, rdma0, wdma0, color0, ccorr0, aal0, gamma0, dither0, mutex,
+ *     imgsys, vdecsys, vencsys, venc_jpg, camsys (minimal.dts:79-260);
+ *     iommu/gce carry no power-domains property and are disabled too.
+ * Bus-protect sequences this removes: every power-domain node above
+ * carries mediatek,infracfg = <&infracfg_ao> (mt6768.dtsi:1035-1137);
+ * mtk-pm-domains issues its bus-protection RMW sequences on that SHARED
+ * infracfg block around domain power on/off. With the controller gone,
+ * zero bus-protect traffic on infracfg comes from the power-domain path.
+ *
+ * GIC untouched. Distinct board identity below.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* H delta 1: scpsys parent inert. */
+&scpsys {
+	status = "disabled";
+};
+
+/* H delta 2: power-controller child inert (explicit, see header). */
+&spm {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, scpsys-bypass)";
+	compatible = "samsung,a32-diag-ewdt-scpsys", "mediatek,mt6769t", "mediatek,mt6768";
+};

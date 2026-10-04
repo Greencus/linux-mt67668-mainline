@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * DT-ONLY graft PAIR 3: clockhold + cpustrip (ewdt-stop lane).
+ *
+ * Mechanism: textual #include of the UNMODIFIED minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY) + deltas.
+ * Kernel/ramdisk/cmdline/geometry pinned to the ewdt-stop lane
+ * (Image-ewdt-stop.gz 4ba146db… + Phase-7 ramdisk f4a0f235… + 81 B cmdline).
+ * Do NOT nest-include the single variants: minimal is included ONCE here
+ * and both delta blocks below are repeated verbatim with source citations.
+ * GIC untouched. PMIC + reserves live in this pair (max clock/CPU removal
+ * only).
+ *
+ * Delta A — clock-hold (source: mt6769t-samsung-a32-diag-ewdt-clockhold.dts
+ * :39-54): whole clock block, atomic. MAIN compatible -> pmOS generic
+ * string, address (reg) untouched; #reset-cells dropped on infracfg_ao only.
+ *
+ * Delta B — cpu-strip (source: mt6769t-samsung-a32-diag-ewdt-cpustrip.dts
+ * :36-88): 27 property deletes — clocks/clock-names/operating-points-v2/
+ * mediatek,cci on cpu0..cpu7, plus clocks/clock-names/operating-points-v2
+ * on &cci. Removes every sync clk_get + OPP + CCI reference the
+ * cpufreq/mediatek-cci drivers bind on (no static clock-frequency added,
+ * by design — see cpustrip header). OPP tables + mcucfg/l2/l3 kept as
+ * orphans, GIC never grafted.
+ *
+ * Diagnostic question: max clock/CPU removal, PMIC+reserves live. Survives
+ * => the hang surface is the interaction of this pair; dies => wider combo
+ * needed.
+ *
+ * Distinct board identity below (board a32-ewdt-clkcpu).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* Pair delta A: clock-hold (cf. ewdt-clockhold.dts :39-54). */
+&topckgen {
+	compatible = "mediatek,topckgen", "syscon";
+};
+&infracfg_ao {
+	compatible = "mediatek,infracfg_ao", "syscon";
+	/delete-property/ #reset-cells;
+};
+&pericfg {
+	compatible = "mediatek,pericfg", "syscon";
+};
+&apmixed {
+	compatible = "mediatek,apmixed", "syscon";
+};
+&mcucfg {
+	compatible = "mediatek,mcucfg";
+};
+
+/* Pair delta B: cpu-strip, 27 deletes (cf. ewdt-cpustrip.dts :36-88). */
+&cpu0 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu1 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu2 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu3 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu4 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu5 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu6 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cpu7 {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+	/delete-property/ mediatek,cci;
+};
+&cci {
+	/delete-property/ clocks;
+	/delete-property/ clock-names;
+	/delete-property/ operating-points-v2;
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic ewdt-stop, clockhold+cpustrip)";
+	compatible = "samsung,a32-diag-ewdt-clkcpu", "mediatek,mt6769t", "mediatek,mt6768";
+};
