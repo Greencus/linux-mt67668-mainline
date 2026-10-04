@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * D2 diagnostic variant: pmOS RAM contract (P0 single-variable test).
+ *
+ * Mechanism: textual #include of the UNMODIFIED Phase-7 minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY — not edited by this
+ * variant) followed by DT-only deltas:
+ *   1. &{/} memory override by DELETE + REPLACE: /delete-node/
+ *      memory@40000000 (the 4 GiB `reg = <0x0 0x40000000 0x1 0x0>` node),
+ *      then re-add memory@40000000 with the LK-trimmed pmOS contract
+ *      `reg = <0x0 0x40000000 0x0 0x3e605000>` (~998 MiB, P0 audit value
+ *      from the pmOS DTB memory node). Method stated: delete + replace
+ *      (not a bare property override), so no 4 GiB residue can survive.
+ *   2. &{/} model/compatible override — distinct board identity so the
+ *      artifact is distinguishable from Phase-7 on /proc/device-tree.
+ *
+ * NOTE: this file intentionally carries NO /dts-v1/; directive — it comes
+ * from the included minimal file (exactly one /dts-v1/ per compilation).
+ * Same kernel (Image-phase7-normal.gz), same ramdisk, same 81 B
+ * cmdline/geometry as Phase-7. Single variable: RAM contract.
+ *
+ * KNOWN COLLISION (explicit, accepted): the ramoops node is KEPT
+ * UNCHANGED for single-variable purity (ramoops@4d010000, reg
+ * <0x0 0x4d010000 0x0 0xe0000>, i.e. 0x4D010000-0x4D0F0000), but the
+ * trimmed top is 0x40000000 + 0x3E605000 = 0x7E605000, so the whole
+ * ramoops reservation (0x4D010000 and ram_console@4d000000 at
+ * 0x4D000000 too) now lies ABOVE described memory, in non-memory.
+ * Expected consequence: the ramoops driver probes a reservation outside
+ * memblock memory and soft-fails (likely -ENOMEM / reservation reject),
+ * creating no /sys/fs/pstore records; the /init K6 markers then fall
+ * back to printk-only (console + /dev/kmsg paths, which do not depend
+ * on pstore). Acceptable for the alive/timing read-out this image
+ * exists for — record, do not "fix" (fixing would add a second
+ * variable and void the A/B).
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* D2 delta 1: LK-trimmed RAM contract (delete + replace, see above). */
+&{/} {
+	/delete-node/ memory@40000000;
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x3e605000>; /* pmOS/P0: ~998 MiB, LK-trimmed */
+	};
+};
+
+/* D2 delta 2: distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic minimal, pmos-memory)";
+	compatible = "samsung,a32-diag-pmos-memory", "mediatek,mt6769t", "mediatek,mt6768";
+};

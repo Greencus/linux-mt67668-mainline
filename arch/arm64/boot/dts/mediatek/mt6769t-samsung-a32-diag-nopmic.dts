@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * D? diagnostic variant: no-pmic-runtime (nopmic-runtime boot).
+ *
+ * Mechanism: textual #include of the UNMODIFIED Phase-7 minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY — not edited by this
+ * variant) followed by DT-only deltas (same include-minimal + overrides
+ * mechanism as the nopstore precedent):
+ *   1. status = "disabled" on each of the 26 suppressible MT6358
+ *      regulator nodes (dependency-gated list below). The 14 always-on
+ *      rails are NEVER touched.
+ *   2. &{/} model/compatible override — distinct board identity so the
+ *      artifact is distinguishable from Phase-7 on /proc/device-tree.
+ *
+ * NOTE: this file intentionally carries NO /dts-v1/; directive — it comes
+ * from the included minimal file (exactly one /dts-v1/ per compilation).
+ * Same Phase-7 kernel, same ramdisk, same cmdline/geometry.
+ *
+ * Dependency basis (verified read-only on the DIAG include closure =
+ * mt6768.dtsi + mt6358.dtsi + diag-minimal deltas; board file
+ * mt6769t-samsung-a32.dts + fragments are NOT included):
+ *   - mt6768.dtsi contains ZERO "-supply" properties and ZERO "mt6358_"
+ *     phandle references (grep-verified): no enabled SoC device can bind
+ *     any MT6358 rail in DIAG.
+ *   - mt6358.dtsi audio-codec node carries no *-supply properties; the
+ *     efuse nodes (soc_data@08000000, efuse@11ce0000) carry no supplies.
+ *   - Every in-tree phandle consumer of a suppressible rail lives ONLY in
+ *     the board file, which is absent by construction in DIAG:
+ *       vgpu/vsram_gpu <- gpu mali-supply + domain-supply + coupled pair
+ *         (a32.dts:245-274); vcn18/vcn28/vcn33 <- BT supplies
+ *         (a32.dts:617-620); vemc <- mmc0 vmmc-supply (a32.dts:168);
+ *         vdram2 <- board always-on override (a32.dts:54-55).
+ *   - All other suppressible rails have no DT consumer anywhere in the
+ *     closure; their peripheral is either absent-by-construction (SIM,
+ *     vibrator, modem/CCCI, connsys/WiFi, panel) or disabled in DIAG
+ *     (gpu, mmc0/mmc1, camsys/imgsys/vdec/venc, auxadc, usb).
+ *
+ * Per-node table (node | regulator-name | consumer | disabling evidence
+ * | action). NEVER-suppress set (vdram1, vcore, vproc11/12, vs2, vmodem,
+ * vs1, vio18, vusb, vsram_proc11/others/proc12, vxo22, va12) untouched.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* Buck rails, peripheral-only. */
+/* vpa | buck_vpa | modem RF PA buck | modem/CCCI absent by construction
+ * (ccci fragment not included; no modem node in closure) | disabled. */
+&mt6358_vpa_reg {
+	status = "disabled";
+};
+
+/* vgpu | buck_vgpu | gpu mali-supply + domain-supply, board-only
+ * (a32.dts:245,274, not included) | &gpu disabled in minimal | disabled. */
+&mt6358_vgpu_reg {
+	status = "disabled";
+};
+
+/* LDO rails, peripheral-only. */
+/* vsram_gpu | ldo_vsram_gpu | gpu coupled pair + domain-supply,
+ * board-only (a32.dts:257-269, not included) | &gpu disabled | disabled. */
+&mt6358_vsram_gpu_reg {
+	status = "disabled";
+};
+
+/* vdram2 | ldo_vdram2 | board always-on override only (a32.dts:54-55,
+ * not included); memory@40000000 carries no supply; DRAM retention stays
+ * on vdram1 (always-on, untouched) | no DIAG consumer | disabled. */
+&mt6358_vdram2_reg {
+	status = "disabled";
+};
+
+/* vsim1 | ldo_vsim1 | SIM | no SIM/UIM node anywhere in closure | disabled. */
+&mt6358_vsim1_reg {
+	status = "disabled";
+};
+
+/* vsim2 | ldo_vsim2 | SIM2 | no SIM/UIM node anywhere in closure | disabled. */
+&mt6358_vsim2_reg {
+	status = "disabled";
+};
+
+/* vibr | ldo_vibr | vibrator | no vibrator node in closure | disabled. */
+&mt6358_vibr_reg {
+	status = "disabled";
+};
+
+/* vrf12 | ldo_vrf12 | modem RF | modem/CCCI absent by construction | disabled. */
+&mt6358_vrf12_reg {
+	status = "disabled";
+};
+
+/* vrf18 | ldo_vrf18 | modem RF | modem/CCCI absent by construction | disabled. */
+&mt6358_vrf18_reg {
+	status = "disabled";
+};
+
+/* vcamio | ldo_vcamio | camera IO | &camsys + &imgsys disabled in minimal | disabled. */
+&mt6358_vcamio_reg {
+	status = "disabled";
+};
+
+/* vcamd | ldo_vcamd | camera digital | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcamd_reg {
+	status = "disabled";
+};
+
+/* vcama1 | ldo_vcama1 | camera analog | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcama1_reg {
+	status = "disabled";
+};
+
+/* vcama2 | ldo_vcama2 | camera analog2 | &camsys + &imgsys disabled | disabled. */
+&mt6358_vcama2_reg {
+	status = "disabled";
+};
+
+/* vcn18 | ldo_vcn18 | BT vcn18-supply, board-only (a32.dts:617) |
+ * bluetooth-a32 absent by construction | disabled. */
+&mt6358_vcn18_reg {
+	status = "disabled";
+};
+
+/* vcn28 | ldo_vcn28 | BT vcn28-supply, board-only (a32.dts:618) |
+ * bluetooth-a32 absent by construction | disabled. */
+&mt6358_vcn28_reg {
+	status = "disabled";
+};
+
+/* vcn33 | ldo_vcn33 | BT+WiFi shared, board-only (a32.dts:619-620) |
+ * BT absent; WiFi module-driven with no DT node | disabled. */
+&mt6358_vcn33_reg {
+	status = "disabled";
+};
+
+/* vfe28 | ldo_vfe28 | analog frontend | no consumer node in closure | disabled. */
+&mt6358_vfe28_reg {
+	status = "disabled";
+};
+
+/* vaux18 | ldo_vaux18 | aux IO | no consumer (&auxadc disabled) | disabled. */
+&mt6358_vaux18_reg {
+	status = "disabled";
+};
+
+/* vbif28 | ldo_vbif28 | battery interface | no BIF consumer node | disabled. */
+&mt6358_vbif28_reg {
+	status = "disabled";
+};
+
+/* vio28 | ldo_vio28 | general 2.8V IO | zero -supply refs in closure | disabled. */
+&mt6358_vio28_reg {
+	status = "disabled";
+};
+
+/* vaud28 | ldo_vaud28 | audio | mt6358codec has no *-supply props;
+ * mt6768.dtsi has zero -supply props, so AFE/codec cannot bind it | disabled. */
+&mt6358_vaud28_reg {
+	status = "disabled";
+};
+
+/* vldo28 | ldo_vldo28 | general LDO | zero -supply refs in closure | disabled. */
+&mt6358_vldo28_reg {
+	status = "disabled";
+};
+
+/* vefuse | ldo_vefuse | eFuse programming | efuse nodes carry no supplies;
+ * OTP rail unneeded at runtime boot | disabled. */
+&mt6358_vefuse_reg {
+	status = "disabled";
+};
+
+/* vmch | ldo_vmch | SD/eMMC HV | &mmc0 + &mmc1 disabled in minimal | disabled. */
+&mt6358_vmch_reg {
+	status = "disabled";
+};
+
+/* vemc | ldo_vemc | mmc0 vmmc-supply, board-only (a32.dts:168) |
+ * &mmc0 disabled in minimal | disabled. */
+&mt6358_vemc_reg {
+	status = "disabled";
+};
+
+/* vmc | ldo_vmc | MMC IO | &mmc0 + &mmc1 disabled in minimal | disabled. */
+&mt6358_vmc_reg {
+	status = "disabled";
+};
+
+/* Distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic minimal, no-pmic-runtime)";
+	compatible = "samsung,a32-diag-nopmic", "mediatek,mt6769t", "mediatek,mt6768";
+};

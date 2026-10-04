@@ -926,6 +926,18 @@ config MEDIATEK_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called mtk_wdt.
 
+config A32_EARLY_WDT_DIAG
+	bool "A32 early TOPRGU WDT quiesce (DIAGNOSTIC ONLY, never production)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	help
+	  Diagnostic-only: stop the MediaTek TOPRGU AP watchdog from an
+	  early_initcall (before the mtk-wdt probe) using the
+	  downstream-proven keyed MODE write clearing EN, and emit
+	  A32-WDT-DIAG pre/post MODE lines at pr_emerg level.
+	  Only WDT_MODE is written; no reset is asserted.
+	  Say N. Enabled solely by the Diagnostic-3 fragment into a
+	  throwaway O directory; never in production configs.
+
 config DIGICOLOR_WATCHDOG
 	tristate "Conexant Digicolor SoCs watchdog support"
 	depends on ARCH_DIGICOLOR || COMPILE_TEST

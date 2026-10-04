@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * D1 diagnostic variant: no-pstore (A/B control for Phase-7).
+ *
+ * Mechanism: textual #include of the UNMODIFIED Phase-7 minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY — not edited by this
+ * variant) followed by DT-only deltas:
+ *   1. /delete-node/ ramoops@4d010000 inside &{/reserved-memory} — removes
+ *      ONLY the ramoops backend node. ram_console@4d000000 is kept mapped.
+ *   2. &{/} model/compatible override — distinct board identity so the
+ *      artifact is distinguishable from Phase-7 on /proc/device-tree.
+ *
+ * NOTE: this file intentionally carries NO /dts-v1/; directive — it comes
+ * from the included minimal file (exactly one /dts-v1/ per compilation).
+ * Same kernel, same ramdisk, same cmdline/geometry as Phase-7.
+ *
+ * Ramdisk-pstore soft-fail (verified in
+ * build/diagnostic/stage-phase7-normal/rd/init): line 73-74 mounts pstore
+ * with `|| echo NO-MOUNT`; line 21 guards the pmsg write with
+ * `[ -d /sys/fs/pstore ]`; lines 117/122 guard the chunk dumps with
+ * `[ -f /sys/fs/pstore/console-ramoops-0 ]` /
+ * `[ -f /sys/fs/pstore/pmsg-ramoops-0 ]`. Without the ramoops node the
+ * kernel creates no /sys/fs/pstore records, every pstore step is skipped,
+ * and the 5 s pet loop is unaffected — INERT.
+ *
+ * Kconfig residual (no rebuild needed for A/B validity): the Phase-7
+ * diag .config (build/diagnostic/out-phase7-normal/.config) still carries
+ * CONFIG_PSTORE=y / CONFIG_PSTORE_RAM=y / CONSOLE / PMSG =y, and the reused
+ * Image-phase7-normal.gz keeps the built-in ramoops driver. The driver
+ * binds ONLY to a DT node with compatible="ramoops" (drivers/fs/pstore/
+ * ramoops.c of_match); with the node deleted there is nothing to probe,
+ * so the driver never attaches and reserved RAM @4d010000 is simply left
+ * untouched. DT-only delta => kernel binary reuse is exact, not an
+ * approximation.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* D1 delta 1: drop ONLY the ramoops backend; ram_console stays. */
+&{/reserved-memory} {
+	/delete-node/ ramoops@4d010000;
+};
+
+/* D1 delta 2: distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic minimal, no-pstore)";
+	compatible = "samsung,a32-diag-nopstore", "mediatek,mt6769t", "mediatek,mt6768";
+};

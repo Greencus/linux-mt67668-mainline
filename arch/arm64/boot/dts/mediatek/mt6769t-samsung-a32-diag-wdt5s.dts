@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * D9 diagnostic variant: toprgu timeout 5 s (WDT A/B control).
+ *
+ * Mechanism: textual #include of the UNMODIFIED Phase-7 minimal DT
+ * (mt6769t-samsung-a32-diag-minimal.dts, READ-ONLY — not edited by this
+ * variant) followed by DT-only deltas:
+ *   1. &toprgu { timeout-sec = <5>; } — shortens the hardware-watchdog
+ *      heartbeat window from the 31 s default to 5 s.
+ *   2. &{/} model/compatible override — distinct board identity so the
+ *      artifact is distinguishable from Phase-7 on /proc/device-tree.
+ *
+ * NOTE: this file intentionally carries NO /dts-v1/; directive — it comes
+ * from the included minimal file (exactly one /dts-v1/ per compilation).
+ * Same kernel, same ramdisk (5 s pet cadence still pets inside a 5 s
+ * window), same cmdline/geometry as Phase-7.
+ *
+ * Driver-honors-DT verification (FIRST, per task — all in-tree, read-only):
+ * - kernel/mainline/drivers/watchdog/mtk_wdt.c:450 sets the default
+ *   wdt_dev.timeout = WDT_MAX_TIMEOUT (31); :452 min_timeout =
+ *   WDT_MIN_TIMEOUT (2); :455 calls
+ *   watchdog_init_timeout(&mtk_wdt->wdt_dev, timeout, dev) where `timeout`
+ *   is the module_param defaulting to 0 (:79, :558).
+ * - kernel/mainline/drivers/watchdog/watchdog_core.c:130-148
+ *   (watchdog_init_timeout): with timeout_parm == 0 the driver value is
+ *   skipped and device_property_read_u32(dev, "timeout-sec", &t) is read;
+ *   t = 5 passes watchdog_timeout_invalid (2 <= 5 <= 31) and becomes
+ *   wdd->timeout. Property MUST be "timeout-sec" — a bare "timeout = <5>"
+ *   would be ignored, so this variant uses timeout-sec.
+ * - LENGTH encoding (mtk_wdt.c:37 WDT_LENGTH_TIMEOUT(n) = (n) << 5, :288):
+ *   toprgu carries no interrupts in mt6768.dtsi, so irq <= 0, pretimeout =
+ *   0 (:442-447); (5 - 0) << 6 = 320, then << 5 = 0x2800 — valid LENGTH.
+ * - Bounds: WDT_MIN_TIMEOUT = 2 <= 5 <= 31 = WDT_MAX_TIMEOUT (mtk_wdt.c
+ *   :35-36). PROCEED — supported, no invention.
+ */
+
+#include "mt6769t-samsung-a32-diag-minimal.dts"
+
+/* D9 delta 1: 5 s hardware-watchdog timeout (driver-honored, see above). */
+&toprgu {
+	timeout-sec = <5>;
+};
+
+/* D9 delta 2: distinct board identity. */
+&{/} {
+	model = "Samsung Galaxy A32 (diagnostic minimal, wdt5s)";
+	compatible = "samsung,a32-diag-wdt5s", "mediatek,mt6769t", "mediatek,mt6768";
+};
