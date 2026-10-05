@@ -677,4 +677,20 @@ config A32_DIAG_REBOOT_PROOF
 	  WARNING: enabling this reboots the board unconditionally at
 	  every boot. Never enable in production. Say N here.
 
+config A32_DIAG_REBOOT_PROOF_L6
+	bool "A32 diagnostic device-initcall reboot proof (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution proof for the Galaxy A32
+	  bring-up: a device_initcall spins briefly (no timers) and then
+	  calls emergency_restart() synchronously, rebooting via the
+	  PSCI SYSTEM_RESET restart handler. A reboot within seconds of
+	  boot proves the kernel reached device initcall level with no
+	  userspace, UART, or pstore involvement. Binary-search step
+	  DOWN from the late_initcall proof: use when the late-level
+	  image stays silent.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
 endmenu

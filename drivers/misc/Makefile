@@ -77,3 +77,4 @@ obj-y				+= amd-sbi/
 obj-$(CONFIG_MISC_RP1)		+= rp1/
 obj-$(CONFIG_MTK_CCCI)		+= mtk-ccci/
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF)	+= diag-reboot-proof.o
+obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L6)	+= diag-reboot-proof-l6.o
