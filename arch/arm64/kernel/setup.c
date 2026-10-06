@@ -60,7 +60,8 @@
 extern void a32_early_wdt_setup_arch_quiesce(void);
 #endif
 
-/* A32 diagnostic setup_arch checkpoints R0-R6 (BOOT-only, diag-only).
+/* A32 diagnostic setup_arch checkpoints R0-R6 + setup_machine_fdt
+ * sub-ladder R0A-R0C (BOOT-only, diag-only).
  * Prototype for drivers/misc/diag-ckpt-setuparch.c; every call site is
  * individually guarded by its own CONFIG_A32_CKPT_Rn, so with all of
  * them =n (production) this decl is unused and links nothing. */
@@ -184,14 +185,32 @@ static void __init setup_machine_fdt(phys_addr_t dt_phys)
 	void *dt_virt = fixmap_remap_fdt(dt_phys, &size, PAGE_KERNEL);
 	const char *name;
 
+#ifdef CONFIG_A32_CKPT_R0A
+	/* R0a: fixmap_remap_fdt() returned (DTB mapped, before reserve). */
+	a32_ckpt(7);
+#endif
+
 	if (dt_virt)
 		memblock_reserve(dt_phys, size);
+
+#ifdef CONFIG_A32_CKPT_R0B
+	/* R0b: memblock_reserve(dt_phys, size) returned (before DT scan). */
+	a32_ckpt(8);
+#endif
 
 	/*
 	 * dt_virt is a fixmap address, hence __pa(dt_virt) can't be used.
 	 * Pass dt_phys directly.
 	 */
-	if (!early_init_dt_scan(dt_virt, dt_phys)) {
+	bool fdt_valid = early_init_dt_scan(dt_virt, dt_phys);
+
+#ifdef CONFIG_A32_CKPT_R0C
+	/* R0c: early_init_dt_scan() returned (verify/root/chosen/memory
+	 * scans done, before the RO remap). */
+	a32_ckpt(9);
+#endif
+
+	if (!fdt_valid) {
 		pr_crit("\n"
 			"Error: invalid device tree blob: PA=%pa, VA=%px, size=%d bytes\n"
 			"The dtb must be 8-byte aligned and must not exceed 2 MB in size.\n"

@@ -92,3 +92,10 @@ obj-$(CONFIG_A32_CKPT_R3)	+= diag-ckpt-setuparch.o
 obj-$(CONFIG_A32_CKPT_R4)	+= diag-ckpt-setuparch.o
 obj-$(CONFIG_A32_CKPT_R5)	+= diag-ckpt-setuparch.o
 obj-$(CONFIG_A32_CKPT_R6)	+= diag-ckpt-setuparch.o
+# A32 setup_machine_fdt sub-ladder R0A-R0C: same ONE shared helper; each
+# image enables EXACTLY ONE CONFIG_A32_CKPT_R0A/B/C, so at most one line
+# below ever fires. Enabling two or more in one .config is a lane
+# violation (harmless to the build, fatal to the read-out).
+obj-$(CONFIG_A32_CKPT_R0A)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R0B)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R0C)	+= diag-ckpt-setuparch.o

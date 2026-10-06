@@ -833,4 +833,45 @@ config A32_CKPT_R6
 	  WARNING: enabling this reboots the board unconditionally at
 	  every boot. Never enable in production. Say N here.
 
+config A32_CKPT_R0A
+	bool "A32 diagnostic setup_machine_fdt checkpoint R0a: after fixmap_remap_fdt() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe INSIDE
+	  setup_machine_fdt(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after fixmap_remap_fdt() maps the DTB (before
+	  memblock_reserve). A reboot proves the kernel reached the
+	  fixmap mapping of the ramcon DTB. Enable EXACTLY ONE of
+	  A32_CKPT_R0..R6,R0A..R0C per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R0B
+	bool "A32 diagnostic setup_machine_fdt checkpoint R0b: after memblock_reserve() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe INSIDE
+	  setup_machine_fdt(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after memblock_reserve(dt_phys, size) (before
+	  early_init_dt_scan). A reboot proves the DT reserve returned.
+	  Enable EXACTLY ONE of A32_CKPT_R0..R6,R0A..R0C per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R0C
+	bool "A32 diagnostic setup_machine_fdt checkpoint R0c: after early_init_dt_scan() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe INSIDE
+	  setup_machine_fdt(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after early_init_dt_scan() returns (covers the
+	  verify/root/chosen/memory scans, before the RO remap). A
+	  reboot proves the DT scan returned. Enable EXACTLY ONE of
+	  A32_CKPT_R0..R6,R0A..R0C per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
 endmenu

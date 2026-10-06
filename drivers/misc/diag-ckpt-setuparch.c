@@ -38,6 +38,14 @@
  * shifts surrounding layout by a few bytes, so Image hashes legitimately
  * differ R-to-R even before any source change.
  *
+ * Sub-ladder R0A-R0C (bisect INSIDE setup_machine_fdt() for the
+ * silent-R0 ramcon lane): same helper, same primitive, new call-site
+ * IDs only — R0A=7 (after fixmap_remap_fdt), R0B=8 (after
+ * memblock_reserve), R0C=9 (after early_init_dt_scan returns). Each
+ * image enables EXACTLY ONE of CONFIG_A32_CKPT_R0A..R0C (default n,
+ * see drivers/misc/Kconfig + Makefile); never mix with R0..R6 in one
+ * image.
+ *
  * Compiled ONLY when at least one CONFIG_A32_CKPT_Rn=y (default n, see
  * drivers/misc/Kconfig + Makefile, exactly-one-y invariant documented
  * there). Never enable in production: the board reboots unconditionally
