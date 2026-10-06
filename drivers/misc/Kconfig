@@ -728,4 +728,24 @@ config A32_DIAG_REBOOT_PROOF_L4D
 	  WARNING: enabling this reboots the board unconditionally at
 	  every boot. Never enable in production. Say N here.
 
+config A32_DIAG_REBOOT_PROOF_L2D
+	bool "A32 diagnostic arch-initcall DIRECT-SMC reboot proof (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution proof for the Galaxy A32
+	  bring-up: an arch_initcall spins briefly (no timers) and then
+	  issues a PSCI SYSTEM_RESET SMC DIRECTLY via arm_smccc_smc(),
+	  bypassing the kernel restart-notifier chain entirely. A reboot
+	  within seconds of boot proves the kernel reached arch initcall
+	  level with no userspace, UART, or pstore involvement -- and,
+	  unlike the emergency_restart() variants, the proof is valid even
+	  if no restart handler was ever registered (handler-independent).
+	  Binary-search DOWN from the L4 direct-SMC proof: use when the
+	  L4D image stays silent and its silence is proven
+	  missing-execution, not missing-handler (GIC/timers/clocks live
+	  at this level -- prime real-estate execution proof).
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
 endmenu
