@@ -976,6 +976,22 @@ config A32_DIAG_HEAD_WDTSTOP
 	  diag-head-wdtstop fragment into a throwaway O directory;
 	  never in production configs.
 
+config A32_DIAG_HEAD_A0
+	bool "A32 head.S entry PSCI reset probe (DIAGNOSTIC ONLY, never production)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	default n
+	help
+	  Diagnostic-only: issue a direct PSCI SYSTEM_RESET SMC
+	  (0x84000009, the same ID the proven diag-ckpt-setuparch lane
+	  issues via arm_smccc_smc(PSCI_0_2_FN_SYSTEM_RESET)) as the
+	  FIRST instruction path of primary_entry in
+	  arch/arm64/kernel/head.S, before any boot-arg save, MMU
+	  setup, or DTB read, with a fail-closed wfi loop if the SMC
+	  returns. The board resets within seconds iff LK jumped to
+	  this kernel. Say N. Enabled solely by the diag-head-a0
+	  fragment into a throwaway O directory; never in production
+	  configs.
+
 config DIGICOLOR_WATCHDOG
 	tristate "Conexant Digicolor SoCs watchdog support"
 	depends on ARCH_DIGICOLOR || COMPILE_TEST

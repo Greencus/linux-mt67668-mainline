@@ -83,6 +83,45 @@
 	 *  x21        primary_entry() .. start_kernel()        FDT pointer passed at boot in x0
 	 */
 SYM_CODE_START(primary_entry)
+#ifdef CONFIG_A32_DIAG_HEAD_A0
+	/*
+	 * A32-DIAG-HEAD-A0 (diagnostic-only, BOOT-only, offline).
+	 * Prove whether a 0x4D0-DTB boot reaches Linux primary_entry AT
+	 * ALL: issue a direct PSCI SYSTEM_RESET SMC as the FIRST
+	 * instruction path, before record_mmu_state, preserve_boot_args,
+	 * TOPRGU access, MMU setup, DT access, and any C code.
+	 * Primitive (not invented): the SAME function ID the proven
+	 * drivers/misc/diag-ckpt-setuparch.c lane issues via
+	 * arm_smccc_smc(PSCI_0_2_FN_SYSTEM_RESET, 0,0,0,0,0,0,0,&res),
+	 * byte-identical to in-tree psci_sys_reset()
+	 * (drivers/firmware/psci/psci.c). Provenance chain:
+	 * include/uapi/linux/psci.h: PSCI_0_2_FN_BASE 0x84000000 +
+	 * PSCI_0_2_FN(n) = BASE+n; PSCI_0_2_FN_SYSTEM_RESET =
+	 * PSCI_0_2_FN(9) = 0x84000009, issued on the 32-bit SMC conduit
+	 * (arm_smccc_smc, params all zero). Raw equivalent below.
+	 * Reg discipline: the SMC calling convention mandates X0=ID,
+	 * X1-X3=params, so x0-x3 (live boot args: x0=FDT) are first
+	 * stashed to x9-x12 temps, then the SMC args are set; no other
+	 * register is touched, no stack, no literal pools, no memory
+	 * access of any kind (pure register + smc), so pre-MMU execution
+	 * is safe under the entry contract. Terminal by design: on a
+	 * working firmware/LK handoff the board resets within seconds;
+	 * if the SMC ever returns, fail closed in a wfi loop (never
+	 * fall through into the boot path, never misreadable).
+	 */
+	mov	x9, x0				// stash live boot args
+	mov	x10, x1
+	mov	x11, x2
+	mov	x12, x3
+	movz	x0, #0x8400, lsl #16		// X0 = 0x84000000
+	movk	x0, #0x9			// X0 = 0x84000009 (SYSTEM_RESET)
+	mov	x1, xzr
+	mov	x2, xzr
+	mov	x3, xzr
+	smc	#0
+8:	wfi
+	b	8b				// fail-closed: never proceed
+#endif
 	bl	record_mmu_state
 	bl	preserve_boot_args
 
