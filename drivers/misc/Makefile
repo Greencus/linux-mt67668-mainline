@@ -81,3 +81,14 @@ obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L6)	+= diag-reboot-proof-l6.o
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L4)	+= diag-reboot-proof-l4.o
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L4D)	+= diag-reboot-proof-l4d.o
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L2D)	+= diag-reboot-proof-l2.o
+# A32 setup_arch checkpoints R0-R6: ONE shared helper; each image enables
+# EXACTLY ONE CONFIG_A32_CKPT_Rn, so at most one line below ever fires and
+# the object is never listed twice. Enabling two or more in one .config is
+# a lane violation (harmless to the build, fatal to the read-out).
+obj-$(CONFIG_A32_CKPT_R0)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R1)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R2)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R3)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R4)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R5)	+= diag-ckpt-setuparch.o
+obj-$(CONFIG_A32_CKPT_R6)	+= diag-ckpt-setuparch.o

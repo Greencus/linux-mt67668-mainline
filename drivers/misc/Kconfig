@@ -748,4 +748,89 @@ config A32_DIAG_REBOOT_PROOF_L2D
 	  WARNING: enabling this reboots the board unconditionally at
 	  every boot. Never enable in production. Say N here.
 
+config A32_CKPT_R0
+	bool "A32 diagnostic setup_arch checkpoint R0: after setup_machine_fdt() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after setup_machine_fdt() returns. A reboot proves
+	  the kernel reached the setup_machine_fdt() return with the
+	  ramcon DTB. Enable EXACTLY ONE of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R1
+	bool "A32 diagnostic setup_arch checkpoint R1: after arm64_memblock_init() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after arm64_memblock_init() returns. Enable
+	  EXACTLY ONE of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R2
+	bool "A32 diagnostic setup_arch checkpoint R2: after paging_init() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after paging_init() returns. Enable EXACTLY ONE
+	  of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R3
+	bool "A32 diagnostic setup_arch checkpoint R3: after bootmem_init() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after bootmem_init() returns. Enable EXACTLY ONE
+	  of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R4
+	bool "A32 diagnostic setup_arch checkpoint R4: after request_standard_resources() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after request_standard_resources() returns.
+	  Enable EXACTLY ONE of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R5
+	bool "A32 diagnostic setup_arch checkpoint R5: after PSCI init (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC
+	  immediately after the psci_dt_init()/psci_acpi_init() block.
+	  Enable EXACTLY ONE of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
+config A32_CKPT_R6
+	bool "A32 diagnostic setup_arch checkpoint R6: end of setup_arch() (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution boundary probe inside
+	  setup_arch(): reboots via direct PSCI SYSTEM_RESET SMC at the
+	  end of setup_arch(). A reboot proves setup_arch() returned.
+	  Enable EXACTLY ONE of A32_CKPT_R0..R6 per image.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
 endmenu

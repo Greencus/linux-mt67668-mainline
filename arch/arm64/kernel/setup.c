@@ -60,6 +60,12 @@
 extern void a32_early_wdt_setup_arch_quiesce(void);
 #endif
 
+/* A32 diagnostic setup_arch checkpoints R0-R6 (BOOT-only, diag-only).
+ * Prototype for drivers/misc/diag-ckpt-setuparch.c; every call site is
+ * individually guarded by its own CONFIG_A32_CKPT_Rn, so with all of
+ * them =n (production) this decl is unused and links nothing. */
+void __init a32_ckpt(int id);
+
 static int num_standard_resources;
 static struct resource *standard_resources;
 
@@ -298,6 +304,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	setup_machine_fdt(__fdt_pointer);
 
+#ifdef CONFIG_A32_CKPT_R0
+	/* R0: setup_machine_fdt() returned (BEFORE the WDT quiesce below). */
+	a32_ckpt(0);
+#endif
+
 #ifdef CONFIG_A32_EARLY_WDT_DIAG
 	/* A32 diag: setup_arch-level TOPRGU WDT neutralization (DIAGNOSTIC
 	 * ONLY). Order-proof: setup_arch() is the earliest C code
@@ -353,7 +364,17 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	arm64_memblock_init();
 
+#ifdef CONFIG_A32_CKPT_R1
+	/* R1: arm64_memblock_init() returned. */
+	a32_ckpt(1);
+#endif
+
 	paging_init();
+
+#ifdef CONFIG_A32_CKPT_R2
+	/* R2: paging_init() returned. */
+	a32_ckpt(2);
+#endif
 
 	acpi_table_upgrade();
 
@@ -365,9 +386,19 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	bootmem_init();
 
+#ifdef CONFIG_A32_CKPT_R3
+	/* R3: bootmem_init() returned. */
+	a32_ckpt(3);
+#endif
+
 	kasan_init();
 
 	request_standard_resources();
+
+#ifdef CONFIG_A32_CKPT_R4
+	/* R4: request_standard_resources() returned. */
+	a32_ckpt(4);
+#endif
 
 	early_ioremap_reset();
 
@@ -375,6 +406,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 		psci_dt_init();
 	else
 		psci_acpi_init();
+
+#ifdef CONFIG_A32_CKPT_R5
+	/* R5: PSCI init block completed (either flavor). */
+	a32_ckpt(5);
+#endif
 
 	arm64_rsi_init();
 
@@ -397,6 +433,11 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 			"This indicates a broken bootloader or old kernel\n",
 			boot_args[1], boot_args[2], boot_args[3]);
 	}
+
+#ifdef CONFIG_A32_CKPT_R6
+	/* R6: end of setup_arch(); reboot proves setup_arch() returned. */
+	a32_ckpt(6);
+#endif
 }
 
 static inline bool cpu_can_disable(unsigned int cpu)
