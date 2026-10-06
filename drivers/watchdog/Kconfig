@@ -957,6 +957,25 @@ config A32_EARLY_WDT_TIMEOUT
 	  Say 0. Set solely via throwaway-O-dir fragments; never in
 	  production configs.
 
+config A32_DIAG_HEAD_WDTSTOP
+	bool "A32 head.S TOPRGU WDT stop (DIAGNOSTIC ONLY, never production)"
+	depends on ARCH_MEDIATEK || COMPILE_TEST
+	default n
+	help
+	  Diagnostic-only: stop the MediaTek TOPRGU AP watchdog with a
+	  keyed MODE write clearing EN as the very first step of the
+	  primary_entry path in arch/arm64/kernel/head.S, before ANY
+	  DTB read. Uses the downstream-proven sequence
+	  (kernel/downstream/drivers/watchdog/mediatek/wdt/common/
+	  wdt_v2/mtk_wdt.h: MTK_WDT_MODE_KEY 0x22000000,
+	  MTK_WDT_MODE_ENABLE 0x0001; mtk_wdt_v2.c mtk_wdt_enable
+	  WK_WDT_DIS: read MODE, OR the KEY, clear ENABLE, sync-write
+	  back; mirrored by mtk_wdt_stop in drivers/watchdog/mtk_wdt.c).
+	  Only WDT_MODE (offset 0x00) is written; STATUS/LENGTH/reset
+	  registers are never touched. Say N. Enabled solely by the
+	  diag-head-wdtstop fragment into a throwaway O directory;
+	  never in production configs.
+
 config DIGICOLOR_WATCHDOG
 	tristate "Conexant Digicolor SoCs watchdog support"
 	depends on ARCH_DIGICOLOR || COMPILE_TEST

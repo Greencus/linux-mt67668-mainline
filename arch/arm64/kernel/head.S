@@ -86,6 +86,38 @@ SYM_CODE_START(primary_entry)
 	bl	record_mmu_state
 	bl	preserve_boot_args
 
+#ifdef CONFIG_A32_DIAG_HEAD_WDTSTOP
+	/*
+	 * A32-DIAG-HEAD-WDTSTOP (diagnostic-only, BOOT-only, offline).
+	 * Stop the TOPRGU AP watchdog before ANY DTB read, so the
+	 * 0x4D0-pack read-out discriminates "LK never jumped" (still
+	 * resets ~30 s) from "kernel started and TOPRGU was the
+	 * resetter" (freezes forever). Placement rationale: x0..x3 are
+	 * already saved to boot_args by preserve_boot_args(), x19 holds
+	 * the MMU-at-entry state, and nothing has touched the DTB yet
+	 * (first DTB read is setup_machine_fdt(), far later). MMU is off
+	 * per the entry contract, so the physical base is used directly;
+	 * the cbnz guard skips the write if LK entered with the MMU on.
+	 * Uses only x9/x10/x11 (caller-saved temps; x0..x3, x19/x20/x21
+	 * untouched, no stack, position-independent). Sequence is the
+	 * downstream-proven stop (wdt_v2/mtk_wdt.h KEY 0x22000000 +
+	 * ENABLE 0x0001; mtk_wdt_v2.c mtk_wdt_enable(WK_WDT_DIS) /
+	 * mtk_wdt_stop(): read MODE, OR KEY, clear EN, write back).
+	 * MODE (0x00) only; STATUS/LENGTH/reset registers never written.
+	 */
+	cbnz	x19, 9f				// MMU was on: skip (phys addr unsafe)
+	movz	x9, #0x1000, lsl #16		// x9 = 0x10000000
+	movk	x9, #0x7000			// x9 = TOPRGU 0x10007000
+	ldr	w10, [x9]			// WDT_MODE
+	movz	x11, #0x2200, lsl #16		// MODE KEY 0x22000000
+	orr	w10, w10, w11
+	bic	w10, w10, #1			// clear ENABLE
+	str	w10, [x9]			// MODE only
+	dsb	sy
+	isb
+9:
+#endif
+
 	adrp	x1, early_init_stack
 	mov	sp, x1
 	mov	x29, xzr
