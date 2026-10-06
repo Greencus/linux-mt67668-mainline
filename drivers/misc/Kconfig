@@ -709,4 +709,23 @@ config A32_DIAG_REBOOT_PROOF_L4
 	  WARNING: enabling this reboots the board unconditionally at
 	  every boot. Never enable in production. Say N here.
 
+config A32_DIAG_REBOOT_PROOF_L4D
+	bool "A32 diagnostic subsys-initcall DIRECT-SMC reboot proof (BOOT-only)"
+	default n
+	help
+	  Diagnostic-only, BOOT-only execution proof for the Galaxy A32
+	  bring-up: a subsys_initcall spins briefly (no timers) and then
+	  issues a PSCI SYSTEM_RESET SMC DIRECTLY via arm_smccc_smc(),
+	  bypassing the kernel restart-notifier chain entirely. A reboot
+	  within seconds of boot proves the kernel reached subsys initcall
+	  level with no userspace, UART, or pstore involvement -- and,
+	  unlike the emergency_restart() variants, the proof is valid even
+	  if no restart handler was ever registered (handler-independent).
+	  Binary-search DOWN from the L4 notifier proof: use when the
+	  notifier-based L4/L6 images stay silent and their silence is
+	  uninterpretable.
+
+	  WARNING: enabling this reboots the board unconditionally at
+	  every boot. Never enable in production. Say N here.
+
 endmenu

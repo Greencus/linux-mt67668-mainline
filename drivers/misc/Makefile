@@ -79,3 +79,4 @@ obj-$(CONFIG_MTK_CCCI)		+= mtk-ccci/
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF)	+= diag-reboot-proof.o
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L6)	+= diag-reboot-proof-l6.o
 obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L4)	+= diag-reboot-proof-l4.o
+obj-$(CONFIG_A32_DIAG_REBOOT_PROOF_L4D)	+= diag-reboot-proof-l4d.o
