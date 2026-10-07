@@ -60,6 +60,13 @@
  * wrapped in #ifdef so the translation unit is empty in every other
  * configuration. That config is enabled solely by the Diagnostic-3
  * fragment into a throwaway O directory; production configs never set it.
+ *
+ * DIAGNOSTIC-ONLY shx-latch addition: when CONFIG_A32_EARLY_WDT_RESTART_PING
+ * is set (default n; shx-latch throwaway O-dir only), the EXTEND branch
+ * above additionally issues one WDT_RESTART reload (offset 0x08, key 0x1971;
+ * provenance at A32_WDT_RESTART_KEY) between dsb sy barriers, plus a
+ * distinct EXTEND+RESTART printk. STOP is untouched and the option unset
+ * leaves the EXTEND branch exactly as before.
  */
 
 #ifdef CONFIG_A32_EARLY_WDT_DIAG
@@ -68,11 +75,28 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <asm/barrier.h>
 #include <asm/early_ioremap.h>
 
 /* TOPRGU WDT_MODE register layout (see header comment for provenance). */
 #define A32_WDT_MODE_OFF	0x00
 #define A32_WDT_LENGTH_OFF	0x04
+/* WDT_RESTART reload offset/key (shx-latch EXTEND+RESTART ping ONLY).
+ * Sourced, not invented:
+ *   - kernel/mainline/drivers/watchdog/mtk_wdt.c:42 WDT_RST 0x08,
+ *     mtk_wdt.c:43 WDT_RST_RELOAD 0x1971, mtk_wdt.c:259-264
+ *     mtk_wdt_ping() iowrite32(WDT_RST_RELOAD, wdt_base + WDT_RST);
+ *   - references/linux/mt6768-mainline-u-boot/drivers/watchdog/
+ *     mtk_wdt.c:17 MTK_WDT_RESTART 0x08, :34 WDT_RESTART_KEY 0x1971,
+ *     :46/:65 writel(WDT_RESTART_KEY, priv->base + MTK_WDT_RESTART);
+ *   - kernel/downstream/drivers/watchdog/mediatek/wdt/common/wdt_v2/
+ *     mtk_wdt.h:22 MTK_WDT_RESTART (MTK_WDT_BASE+0x0008),
+ *     mtk_wdt.h:91-92 MTK_WDT_RESTART_KEY (0x1971).
+ * Never used unless CONFIG_A32_EARLY_WDT_RESTART_PING is set (shx-latch
+ * O-dir only). No MODE/SWRST/SWSYSRST/REQ_MODE/STATUS/NONRST write exists
+ * anywhere in this file. */
+#define A32_WDT_RESTART_OFF	0x08
+#define A32_WDT_RESTART_KEY	0x1971
 #define A32_WDT_STATUS_OFF	0x0C
 #define A32_WDT_MODE_KEY	0x22000000
 #define A32_WDT_MODE_ENABLE	0x0001
@@ -122,6 +146,20 @@ static void __init a32_early_wdt_core(void __iomem *base, const char *via)
 			ticks = 0x7FF;
 		length = (ticks << 5) | A32_WDT_LENGTH_KEY;
 		writel(length, base + A32_WDT_LENGTH_OFF);
+#ifdef CONFIG_A32_EARLY_WDT_RESTART_PING
+		/* DIAGNOSTIC-ONLY shx-latch: one RESTART reload so the new
+		 * LENGTH latches now instead of at the next ping (see the
+		 * A32_WDT_RESTART_KEY provenance above). EXTEND-branch only;
+		 * compiled out in every other config, so STOP and plain
+		 * EXTEND behavior are unchanged there. */
+		dsb(sy);
+		writel(A32_WDT_RESTART_KEY, base + A32_WDT_RESTART_OFF);
+		dsb(sy);
+
+		pr_emerg("A32-EARLY-WDT: EXTEND+RESTART COMPLETE LENGTH=0x%08x MODE=0x%08x\n",
+			 readl(base + A32_WDT_LENGTH_OFF),
+			 readl(base + A32_WDT_MODE_OFF));
+#endif
 
 		pr_emerg("A32-EARLY-WDT: EXTEND COMPLETE LENGTH=0x%08x MODE=0x%08x\n",
 			 readl(base + A32_WDT_LENGTH_OFF),

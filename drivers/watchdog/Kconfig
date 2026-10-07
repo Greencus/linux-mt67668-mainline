@@ -957,6 +957,26 @@ config A32_EARLY_WDT_TIMEOUT
 	  Say 0. Set solely via throwaway-O-dir fragments; never in
 	  production configs.
 
+config A32_EARLY_WDT_RESTART_PING
+	bool "A32 early TOPRGU WDT RESTART ping after LENGTH extend (DIAGNOSTIC ONLY, never production)"
+	depends on A32_EARLY_WDT_DIAG
+	default n
+	help
+	  Diagnostic-only: in the EXTEND (TIMEOUT>0) branch of
+	  drivers/watchdog/mtk_wdt_a32_early.c ONLY, issue one
+	  WDT_RESTART reload write (offset 0x08, key 0x1971) after the
+	  LENGTH write, with dsb sy on both sides, so the new LENGTH
+	  latches (the WDT counter otherwise keeps the old window
+	  until the next reload). STOP (TIMEOUT==0) behavior is
+	  untouched, and with this option unset the EXTEND branch is
+	  byte-identical to before. Sourced, not invented:
+	  drivers/watchdog/mtk_wdt.c WDT_RST 0x08 / WDT_RST_RELOAD
+	  0x1971 / mtk_wdt_ping(); downstream
+	  drivers/watchdog/mediatek/wdt/common/wdt_v2/mtk_wdt.h
+	  MTK_WDT_RESTART (+0x0008) / MTK_WDT_RESTART_KEY (0x1971).
+	  Say N. Set solely via throwaway-O-dir fragments; never in
+	  production configs.
+
 config A32_DIAG_HEAD_WDTSTOP
 	bool "A32 head.S TOPRGU WDT stop (DIAGNOSTIC ONLY, never production)"
 	depends on ARCH_MEDIATEK || COMPILE_TEST
